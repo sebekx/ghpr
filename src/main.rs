@@ -1,6 +1,7 @@
 mod app;
 mod diff_view;
 mod github;
+mod highlight;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -77,7 +78,7 @@ fn run_app(
     loop {
         app.process_bg_messages();
 
-        terminal.draw(|f| ui::draw(f, app))?;
+        terminal.draw(|f| ui::draw(f, &mut *app))?;
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
@@ -155,6 +156,9 @@ fn run_app(
                             KeyCode::Esc => dv.cancel_input(),
                             KeyCode::Enter => dv.submit_input(),
                             KeyCode::Backspace => { dv.input_buffer.pop(); }
+                            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                dv.toggle_resolve();
+                            }
                             KeyCode::Char(c) => dv.input_buffer.push(c),
                             _ => {}
                         }
@@ -255,6 +259,9 @@ fn run_app(
                         }
                         KeyCode::Char('S') => {
                             app.submit_drafts();
+                        }
+                        KeyCode::Char('R') => {
+                            app.resolve_thread_at_cursor();
                         }
                         KeyCode::Char('?') => { app.show_help = true; }
                         _ => {}

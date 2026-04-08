@@ -497,6 +497,33 @@ impl GithubClient {
         Ok(())
     }
 
+    /// Resolve a review thread via GraphQL
+    pub async fn resolve_thread(&self, thread_node_id: &str) -> Result<()> {
+        let query = format!(
+            r#"{{ "query": "mutation {{ resolveReviewThread(input: {{ threadId: \"{thread_node_id}\" }}) {{ thread {{ isResolved }} }} }}" }}"#
+        );
+        let resp = self
+            .client
+            .post("https://api.github.com/graphql")
+            .header(reqwest::header::USER_AGENT, "ghpr-tui")
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", self.token))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(query)
+            .send()
+            .await
+            .context("GraphQL resolve failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("GitHub API error {}: {}", status, text);
+        }
+        let data: serde_json::Value = resp.json().await?;
+        if let Some(errors) = data.get("errors") {
+            anyhow::bail!("GraphQL error: {}", errors);
+        }
+        Ok(())
+    }
+
     pub async fn build_threads_from_rest(
         &self,
         repo: &str,
@@ -556,6 +583,7 @@ impl GithubClient {
                     side,
                     is_resolved: false,
                     comments: thread_comments,
+                    node_id: None,
                 }
             })
             .collect()
@@ -574,7 +602,7 @@ impl GithubClient {
         pr_number: u64,
     ) -> Result<Vec<ReviewThread>> {
         let query = format!(
-            r#"{{ "query": "query {{ repository(owner: \"{owner}\", name: \"{repo}\") {{ pullRequest(number: {pr_number}) {{ reviewThreads(first: 100) {{ nodes {{ isResolved path line originalLine startLine originalStartLine diffSide comments(first: 50) {{ nodes {{ id databaseId body author {{ login }} createdAt }} }} }} }} }} }} }}" }}"#
+            r#"{{ "query": "query {{ repository(owner: \"{owner}\", name: \"{repo}\") {{ pullRequest(number: {pr_number}) {{ reviewThreads(first: 100) {{ nodes {{ id isResolved path line originalLine startLine originalStartLine diffSide comments(first: 50) {{ nodes {{ id databaseId body author {{ login }} createdAt }} }} }} }} }} }} }}" }}"#
         );
 
         let resp = self
@@ -637,12 +665,14 @@ impl GithubClient {
                                     .collect()
                             })
                             .unwrap_or_default();
+                        let node_id = node.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
                         Some(ReviewThread {
                             path,
                             line,
                             side,
                             is_resolved,
                             comments,
+                            node_id,
                         })
                     })
                     .collect()
@@ -666,6 +696,8 @@ pub struct ReviewThread {
     pub side: DiffSide,
     pub is_resolved: bool,
     pub comments: Vec<ThreadComment>,
+    /// GraphQL node ID for resolving the thread
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

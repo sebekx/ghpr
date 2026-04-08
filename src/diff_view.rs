@@ -1,4 +1,5 @@
 use crate::github::{DiffSide, ReviewThread};
+use crate::highlight::{HighlightedFile, Highlighter};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -28,6 +29,12 @@ pub struct DiffView {
     pub file_level_threads: Vec<usize>,
     /// File-level Claude comments (line not in diff) for current file
     pub file_level_claude: Vec<usize>,
+    /// Syntax highlight cache: file_index -> highlighted data
+    pub highlight_cache: HashMap<usize, HighlightedFile>,
+    /// Thread indices pending resolve (draft)
+    pub pending_resolves: Vec<usize>,
+    /// Rendered line offset for input overlay positioning (set during draw)
+    pub input_target_line: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,12 +86,13 @@ pub struct DraftComment {
     pub line: u64,
     pub body: String,
     pub in_reply_to_thread: Option<usize>,
+    pub resolve: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum InputMode {
     NewComment { diff_line: usize },
-    Reply { thread_idx: usize },
+    Reply { thread_idx: usize, resolve: bool },
     EditClaude { claude_idx: usize },
 }
 
@@ -113,6 +121,9 @@ impl DiffView {
             line_claude: HashMap::new(),
             file_level_threads: Vec::new(),
             file_level_claude: Vec::new(),
+            highlight_cache: HashMap::new(),
+            pending_resolves: Vec::new(),
+            input_target_line: None,
         };
         view.rebuild_line_maps();
         view
@@ -130,6 +141,30 @@ impl DiffView {
 
     pub fn current_file(&self) -> Option<&DiffFile> {
         self.files.get(self.selected_file)
+    }
+
+    /// Ensure syntax highlighting is cached for the current file
+    pub fn ensure_highlighted(&mut self, highlighter: &Highlighter) {
+        let idx = self.selected_file;
+        if self.highlight_cache.contains_key(&idx) {
+            return;
+        }
+        let Some(file) = self.files.get(idx) else { return };
+        // Collect code lines stripping +/- prefix
+        let code_lines: Vec<&str> = file.lines.iter().map(|dl| {
+            let c = dl.content.as_str();
+            match dl.kind {
+                LineKind::Added | LineKind::Removed => {
+                    if c.is_empty() { c } else { &c[1..] }
+                }
+                LineKind::Context => {
+                    if c.starts_with(' ') { &c[1..] } else { c }
+                }
+                _ => c,
+            }
+        }).collect();
+        let highlighted = highlighter.highlight_file(&file.path, &code_lines);
+        self.highlight_cache.insert(idx, highlighted);
     }
 
     pub fn select_file(&mut self, idx: usize) {
@@ -254,6 +289,87 @@ impl DiffView {
 
     pub fn page_up(&mut self, page_size: usize) {
         self.cursor_line = self.cursor_line.saturating_sub(page_size);
+    }
+
+    /// Compute rendered line count for each diff line (1 for the line itself + inline comments)
+    pub fn compute_line_heights(&self, wrap_width: usize) -> Vec<usize> {
+        let Some(file) = self.current_file() else { return Vec::new() };
+        let w = wrap_width.max(10);
+
+        file.lines.iter().enumerate().map(|(li, dl)| {
+            let mut h: usize = 1; // the diff line itself
+
+            // Inline thread comments
+            if let Some(thread_indices) = self.line_threads.get(&li) {
+                for &ti in thread_indices {
+                    if self.file_level_threads.contains(&ti) { continue; }
+                    if let Some(thread) = self.threads.get(ti) {
+                        h += 1; // ┌─ Thread header
+                        for comment in &thread.comments {
+                            h += count_wrapped_lines(&comment.body, w);
+                        }
+                        for draft in &self.draft_comments {
+                            if draft.in_reply_to_thread == Some(ti) {
+                                h += count_wrapped_lines(&draft.body, w);
+                            }
+                        }
+                        h += 1; // └─ footer
+                    }
+                }
+            }
+
+            // Inline Claude comments
+            if let Some(claude_indices) = self.line_claude.get(&li) {
+                for &ci in claude_indices {
+                    if let Some(cc) = self.claude_comments.get(ci) {
+                        h += 1; // header
+                        h += count_wrapped_lines(&cc.body, w);
+                        h += 1; // footer
+                    }
+                }
+            }
+
+            // Draft new comments (not replies)
+            for draft in &self.draft_comments {
+                if draft.in_reply_to_thread.is_none() && draft.file == file.path {
+                    if dl.new_line == Some(draft.line) || dl.old_line == Some(draft.line) {
+                        h += 1; // header
+                        h += count_wrapped_lines(&draft.body, w);
+                        h += 1; // footer
+                    }
+                }
+            }
+
+            h
+        }).collect()
+    }
+
+    /// Adjust scroll so cursor_line is visible, accounting for inline comment heights
+    pub fn adjust_scroll(&mut self, inner_height: usize, inner_width: usize) {
+        if inner_height == 0 { return; }
+        let heights = self.compute_line_heights(inner_width.saturating_sub(14));
+        if heights.is_empty() { return; }
+
+        let cursor = self.cursor_line.min(heights.len().saturating_sub(1));
+        let scroll = self.scroll.min(heights.len().saturating_sub(1));
+
+        if cursor < scroll {
+            // Cursor above visible area
+            self.scroll = cursor;
+        } else {
+            // Check if cursor is below visible area
+            let rendered: usize = heights[scroll..=cursor].iter().sum();
+            if rendered > inner_height {
+                // Scroll forward until cursor fits on screen
+                let mut new_scroll = scroll;
+                while new_scroll < cursor {
+                    let vis: usize = heights[new_scroll..=cursor].iter().sum();
+                    if vis <= inner_height { break; }
+                    new_scroll += 1;
+                }
+                self.scroll = new_scroll;
+            }
+        }
     }
 
     /// Check if a file (by index) has any comments
@@ -391,7 +507,7 @@ impl DiffView {
             for li in lines_to_check {
                 if let Some(thread_indices) = self.line_threads.get(&li) {
                     if let Some(&ti) = thread_indices.first() {
-                        self.input_mode = Some(InputMode::Reply { thread_idx: ti });
+                        self.input_mode = Some(InputMode::Reply { thread_idx: ti, resolve: false });
                         self.input_buffer.clear();
                         return;
                     }
@@ -422,9 +538,10 @@ impl DiffView {
                     line: line_num,
                     body: self.input_buffer.clone(),
                     in_reply_to_thread: None,
+                    resolve: false,
                 });
             }
-            Some(InputMode::Reply { thread_idx }) => {
+            Some(InputMode::Reply { thread_idx, resolve }) => {
                 let line_num = self
                     .threads
                     .get(*thread_idx)
@@ -440,6 +557,7 @@ impl DiffView {
                     line: line_num,
                     body: self.input_buffer.clone(),
                     in_reply_to_thread: Some(*thread_idx),
+                    resolve: *resolve,
                 });
             }
             Some(InputMode::EditClaude { claude_idx }) => {
@@ -451,6 +569,7 @@ impl DiffView {
                         line: cc.line,
                         body: cc.body.clone(),
                         in_reply_to_thread: None,
+                        resolve: false,
                     });
                 }
             }
@@ -458,6 +577,12 @@ impl DiffView {
         }
         self.input_buffer.clear();
         self.input_mode = None;
+    }
+
+    pub fn toggle_resolve(&mut self) {
+        if let Some(InputMode::Reply { resolve, .. }) = &mut self.input_mode {
+            *resolve = !*resolve;
+        }
     }
 
     pub fn cancel_input(&mut self) {
@@ -503,6 +628,7 @@ impl DiffView {
                         line: cc.line,
                         body: cc.body.clone(),
                         in_reply_to_thread: None,
+                        resolve: false,
                     });
                 }
             }
@@ -738,4 +864,22 @@ fn build_tree(files: &[DiffFile]) -> Vec<TreeNode> {
 
     flatten(&root, "", 0, &mut nodes);
     nodes
+}
+
+/// Count how many rendered lines a text block produces when wrapped to `width`
+fn count_wrapped_lines(text: &str, width: usize) -> usize {
+    let w = width.max(10);
+    let mut count = 0;
+    for line in text.lines() {
+        if line.len() <= w {
+            count += 1;
+        } else {
+            let mut remaining = line.len();
+            while remaining > 0 {
+                count += 1;
+                remaining = remaining.saturating_sub(w);
+            }
+        }
+    }
+    count.max(1)
 }

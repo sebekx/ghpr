@@ -1,5 +1,6 @@
 use crate::diff_view::{ClaudeComment, DiffView};
 use crate::github::{CiState, GithubClient, PrStatus, PullRequest, RepoInfo};
+use crate::highlight::Highlighter;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
@@ -27,7 +28,7 @@ pub enum BgMsg {
     ClaudeReviewParsed(Vec<ClaudeComment>),
     ClaudeReviewOutput(String),
     ApproveResult(Result<(), String>),
-    SubmitResult(Result<usize, String>),
+    SubmitResult(Result<(usize, String), String>),
 }
 
 /// A flattened PR entry with its repo name
@@ -71,6 +72,7 @@ pub struct App {
     pending_claude: Option<Vec<ClaudeComment>>,
     pub file_pane_width: u16,
     pub approve_popup: Option<ApprovePopup>,
+    pub highlighter: Highlighter,
 }
 
 pub struct ApprovePopup {
@@ -124,6 +126,7 @@ impl App {
             pending_claude: None,
             file_pane_width: 30,
             approve_popup: None,
+            highlighter: Highlighter::new(),
         }
     }
 
@@ -425,13 +428,16 @@ impl App {
         });
     }
 
-    /// Submit all draft comments to GitHub
+    /// Submit all draft comments and pending resolves to GitHub
     pub fn submit_drafts(&mut self) {
         let Some(dv) = &self.diff_view else { return };
-        if dv.draft_comments.is_empty() { return; }
+        if dv.draft_comments.is_empty() && dv.pending_resolves.is_empty() { return; }
 
         let drafts = dv.draft_comments.clone();
         let threads = dv.threads.clone();
+        let standalone_resolves: Vec<String> = dv.pending_resolves.iter()
+            .filter_map(|&ti| threads.get(ti)?.node_id.clone())
+            .collect();
         let repo = dv.repo_name.clone();
         let pr_number = dv.pr_number;
         let client = self.client.clone();
@@ -440,16 +446,23 @@ impl App {
         let count = drafts.len();
 
         tokio::spawn(async move {
-            // Separate new comments from replies
+            // Separate new comments from replies, collect threads to resolve
             let mut new_comments: Vec<(String, u64, String)> = Vec::new();
             let mut replies: Vec<(u64, String)> = Vec::new();
+            let mut resolve_ids: Vec<String> = standalone_resolves;
 
             for draft in &drafts {
                 if let Some(thread_idx) = draft.in_reply_to_thread {
-                    // Reply to existing thread — use first comment's ID
                     if let Some(thread) = threads.get(thread_idx) {
                         if let Some(first) = thread.comments.first() {
                             replies.push((first.id, draft.body.clone()));
+                        }
+                        if draft.resolve {
+                            if let Some(node_id) = &thread.node_id {
+                                if !resolve_ids.contains(node_id) {
+                                    resolve_ids.push(node_id.clone());
+                                }
+                            }
                         }
                     }
                 } else {
@@ -457,11 +470,71 @@ impl App {
                 }
             }
 
-            match client.submit_review(&repo, pr_number, new_comments, replies).await {
-                Ok(()) => { let _ = tx.send(BgMsg::SubmitResult(Ok(count))); }
-                Err(e) => { let _ = tx.send(BgMsg::SubmitResult(Err(e.to_string()))); }
+            // Submit comments if any
+            if !new_comments.is_empty() || !replies.is_empty() {
+                if let Err(e) = client.submit_review(&repo, pr_number, new_comments, replies).await {
+                    let _ = tx.send(BgMsg::SubmitResult(Err(e.to_string())));
+                    return;
+                }
             }
+
+            // Resolve threads
+            let mut resolve_errors = Vec::new();
+            for node_id in &resolve_ids {
+                if let Err(e) = client.resolve_thread(node_id).await {
+                    resolve_errors.push(e.to_string());
+                }
+            }
+
+            let resolved_count = resolve_ids.len() - resolve_errors.len();
+            let mut parts = Vec::new();
+            if count > 0 {
+                parts.push(format!("{} comment{}", count, if count == 1 { "" } else { "s" }));
+            }
+            if resolved_count > 0 {
+                parts.push(format!("{} resolved", resolved_count));
+            }
+            let msg = if resolve_errors.is_empty() {
+                format!("Submitted: {}", parts.join(", "))
+            } else {
+                format!("Submitted: {} (resolve failed: {})", parts.join(", "), resolve_errors.join("; "))
+            };
+            let _ = tx.send(BgMsg::SubmitResult(Ok((count, msg))));
         });
+    }
+
+    /// Toggle draft resolve on the thread nearest to cursor
+    pub fn resolve_thread_at_cursor(&mut self) {
+        let Some(dv) = &mut self.diff_view else { return };
+        // Find nearest thread within ±3 lines
+        let mut found_ti = None;
+        for offset in 0..=3usize {
+            let lines_to_check: Vec<usize> = if offset == 0 {
+                vec![dv.cursor_line]
+            } else {
+                vec![dv.cursor_line.saturating_sub(offset), dv.cursor_line + offset]
+            };
+            for li in lines_to_check {
+                if let Some(thread_indices) = dv.line_threads.get(&li) {
+                    if let Some(&ti) = thread_indices.first() {
+                        found_ti = Some(ti);
+                        break;
+                    }
+                }
+            }
+            if found_ti.is_some() { break; }
+        }
+
+        let Some(ti) = found_ti else { return };
+        if let Some(thread) = dv.threads.get(ti) {
+            if thread.is_resolved { return; }
+        }
+        // Toggle: add or remove from pending_resolves
+        if let Some(pos) = dv.pending_resolves.iter().position(|&x| x == ti) {
+            dv.pending_resolves.remove(pos);
+        } else {
+            dv.pending_resolves.push(ti);
+        }
     }
 
     /// Fetch review threads in background
@@ -493,7 +566,7 @@ impl App {
         self.pending_threads = None;
         self.pending_claude = None;
         self.tree_index = 0;
-        self.diff_focus = DiffFocus::Content;
+        self.diff_focus = DiffFocus::Files;
         let Some(repo_name) = self.selected_repo_name() else { return };
         let Some(pr) = self.selected_pr().cloned() else { return };
 
@@ -683,10 +756,12 @@ If no comments, output:
                         if let Some(comments) = self.pending_claude.take() {
                             dv.set_claude_comments(comments);
                         }
-                        // Set tree_index to first file (skip dirs)
+                        // Set tree_index to first file (skip dirs) and sync
                         self.tree_index = dv.tree.iter()
                             .position(|n| !n.is_dir)
                             .unwrap_or(0);
+                        dv.tree_select(self.tree_index);
+                        dv.ensure_highlighted(&self.highlighter);
                         self.diff_view = Some(dv);
                     }
                     self.current_diff = Some(diff);
@@ -717,11 +792,12 @@ If no comments, output:
                 }
                 BgMsg::SubmitResult(result) => {
                     match result {
-                        Ok(count) => {
-                            // Clear drafts and re-fetch threads so submitted comments appear
+                        Ok((_count, msg)) => {
+                            // Clear drafts/resolves and re-fetch threads
                             if let Some(dv) = &mut self.diff_view {
                                 dv.draft_comments.clear();
-                                dv.submit_status = Some(format!("Submitted {} comment{}", count, if count == 1 { "" } else { "s" }));
+                                dv.pending_resolves.clear();
+                                dv.submit_status = Some(msg);
                             }
                             if let (Some(repo), Some(pr)) = (self.selected_repo_name(), self.selected_pr().cloned()) {
                                 self.fetch_threads(&repo, &pr);
