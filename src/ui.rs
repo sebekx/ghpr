@@ -39,10 +39,6 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_status_bar(f, app, chunks[1]);
     }
 
-    if let Some(popup) = &app.review_popup {
-        draw_review_popup(f, popup, size);
-    }
-
     if let Some(popup) = &app.approve_popup {
         draw_approve_popup(f, popup, size);
     }
@@ -52,40 +48,6 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 }
 
-fn draw_review_popup(f: &mut Frame, popup: &crate::app::ReviewPopup, area: Rect) {
-    let popup_width = (area.width as f32 * 0.8) as u16;
-    let popup_height = (area.height as f32 * 0.8) as u16;
-    let x = (area.width.saturating_sub(popup_width)) / 2;
-    let y = (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
-
-    f.render_widget(Clear, popup_area);
-
-    let title = if popup.loading {
-        format!(" {} {} ", NERD_REFRESH, popup.title)
-    } else {
-        format!(" {} ", popup.title)
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .title_bottom(" Esc close │ ↑↓ scroll ")
-        .border_style(Style::default().fg(Color::Magenta));
-
-    let lines: Vec<Line> = popup
-        .content
-        .lines()
-        .map(|line| Line::from(Span::raw(line)))
-        .collect();
-
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((popup.scroll, 0));
-
-    f.render_widget(paragraph, popup_area);
-}
 
 fn draw_help_popup(f: &mut Frame, area: Rect) {
     let w = 52u16.min(area.width.saturating_sub(4));
@@ -136,13 +98,13 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         h("\u{f4a1}", Color::Cyan, "Pending review"),
         Line::from(""),
         s("Attention"),
-        h("\u{f06a}", Color::Red, "Changes requested"),
+        h("\u{f06a}", Color::Red, "Changes requested / conflict"),
         h("\u{f075}", Color::Yellow, "Has review comments"),
+        h("\u{f407}", Color::Green, "Ready to merge"),
         Line::from(""),
         s("Keys"),
         h("↑↓/jk", Color::DarkGray, "Navigate / scroll"),
         h("Tab", Color::DarkGray, "Switch panel"),
-        h("1/2", Color::DarkGray, "Overview / Diff tab"),
         h("a", Color::DarkGray, "Toggle assigned / all"),
         h("c", Color::DarkGray, "Claude review"),
         h("r", Color::DarkGray, "Refresh"),
@@ -276,6 +238,30 @@ fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
                         review_icon.to_string(),
                         Style::default().fg(review_color),
                     ));
+                }
+            }
+
+            // Merge status indicators
+            match pr.mergeable_state.as_deref() {
+                Some("dirty") | Some("blocked") => {
+                    // Conflict or blocked
+                    indicators.push(Span::styled(
+                        "\u{f06a} ", // exclamation circle
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+                _ => {
+                    if pr.mergeable == Some(false) {
+                        indicators.push(Span::styled(
+                            "\u{f06a} ",
+                            Style::default().fg(Color::Red),
+                        ));
+                    } else if pr.mergeable_state.as_deref() == Some("clean") && pr.mergeable == Some(true) {
+                        indicators.push(Span::styled(
+                            "\u{f00c} ", // check — ready to merge
+                            Style::default().fg(Color::Rgb(0, 200, 100)),
+                        ));
+                    }
                 }
             }
 
@@ -419,6 +405,52 @@ fn draw_details_panel(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
     ];
+
+    // Merge status
+    match pr.mergeable {
+        Some(false) => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "\u{f06a} Conflict — cannot merge",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+        }
+        Some(true) => {
+            if pr.mergeable_state.as_deref() == Some("clean") {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "\u{f00c} Ready to merge",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                )));
+            }
+        }
+        _ => {}
+    }
+
+    // Description
+    if let Some(body) = &pr.body {
+        let body_trimmed = body.trim();
+        if !body_trimmed.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Description:",
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            for (i, desc_line) in body_trimmed.lines().enumerate() {
+                if i >= 15 {
+                    lines.push(Line::from(Span::styled(
+                        "  …",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    break;
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", desc_line),
+                    Style::default().fg(Color::Rgb(180, 180, 200)),
+                )));
+            }
+        }
+    }
 
     if let Some(status) = app.pr_status(repo_name, pr.number) {
         lines.push(Line::from(""));
@@ -589,7 +621,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         "all…"
     };
     let nav_help = format!(
-        " ↑↓ navigate │ Tab panel │ a [{filter_label}] │ Enter diff │ A approve │ c review │ r refresh │ o open │ ? help │ q quit "
+        " ↑↓ navigate │ Tab panel │ a [{filter_label}] │ Enter diff │ A approve │ r refresh │ o open │ ? help │ q quit "
     );
 
     let help = Paragraph::new(Span::styled(
@@ -704,7 +736,44 @@ fn draw_diff_view(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
 
     // Input overlay
     if dv.input_mode.is_some() {
-        draw_input_overlay(f, dv, area);
+        draw_input_overlay(f, dv, chunks[1]);
+    }
+
+    // Claude review output popup
+    if dv.loading_review || !dv.review_output.is_empty() {
+        let popup_width = (area.width as f32 * 0.8) as u16;
+        let popup_height = (area.height as f32 * 0.75) as u16;
+        let x = (area.width.saturating_sub(popup_width)) / 2;
+        let y = (area.height.saturating_sub(popup_height)) / 2;
+        let popup_area = Rect::new(x, y, popup_width, popup_height);
+        f.render_widget(Clear, popup_area);
+
+        let title = if dv.loading_review {
+            format!(" {} Claude Review ", NERD_REFRESH)
+        } else {
+            " Claude Review (done) ".to_string()
+        };
+        let bottom = if dv.loading_review {
+            " ↑↓ scroll │ Esc hide "
+        } else {
+            " Press any key to close "
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .title_bottom(bottom)
+            .border_style(Style::default().fg(Color::Magenta));
+
+        let lines: Vec<Line> = dv.review_output
+            .lines()
+            .map(|l| Line::from(Span::raw(l)))
+            .collect();
+
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((dv.review_scroll, 0));
+        f.render_widget(paragraph, popup_area);
     }
 }
 
@@ -733,11 +802,15 @@ fn draw_file_tree(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                 if let Some(file) = dv.files.get(fi) {
                     let has_unresolved = dv.threads.iter().any(|t| t.path == file.path && !t.is_resolved);
                     let has_resolved_only = !has_unresolved && dv.threads.iter().any(|t| t.path == file.path);
-                    let has_claude = dv.claude_comments.iter().any(|c| c.file == file.path && c.accepted.is_none());
+                    let has_claude_pending = dv.claude_comments.iter().any(|c| c.file == file.path && c.accepted.is_none());
+                    let has_drafts = dv.draft_comments.iter().any(|d| d.file == file.path);
+                    let has_claude_accepted = dv.claude_comments.iter().any(|c| c.file == file.path && c.accepted == Some(true));
 
                     if has_unresolved {
                         comment_indicator = Span::styled(" \u{f075}", Style::default().fg(Color::Yellow));
-                    } else if has_claude {
+                    } else if has_drafts || has_claude_accepted {
+                        comment_indicator = Span::styled(" \u{f040}", Style::default().fg(Color::Green)); // pencil — has drafts
+                    } else if has_claude_pending {
                         comment_indicator = Span::styled(" \u{f12a}", Style::default().fg(Color::Magenta));
                     } else if has_resolved_only {
                         comment_indicator = Span::styled(" \u{f075}", Style::default().fg(Color::DarkGray));
@@ -808,6 +881,12 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
         )));
         for &ti in &dv.file_level_threads {
             if let Some(thread) = dv.threads.get(ti) {
+                let thread_bg = if thread.is_resolved {
+                    Color::Reset
+                } else {
+                    Color::Rgb(60, 45, 10)
+                };
+                let line_bg_style = Style::default().bg(thread_bg);
                 let resolved_style = if thread.is_resolved {
                     Style::default().fg(Color::Green)
                 } else {
@@ -816,23 +895,25 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                 let resolve_icon = if thread.is_resolved { " \u{f00c}" } else { "" };
                 let line_info = thread.line.map(|l| format!(" line {}", l)).unwrap_or_default();
                 lines.push(Line::from(vec![
+                    Span::raw("  "),
                     Span::styled(
-                        format!("  ┌─ \u{f075} Thread{} ", line_info),
+                        format!("┌─ \u{f075} Thread{} ", line_info),
                         resolved_style,
                     ),
                     Span::styled(
                         resolve_icon,
                         Style::default().fg(Color::Green),
                     ),
-                ]));
+                ]).style(line_bg_style));
                 for comment in &thread.comments {
                     let c_style = if thread.is_resolved {
                         Style::default().fg(Color::DarkGray)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(Color::Rgb(200, 190, 170))
                     };
                     lines.push(Line::from(vec![
-                        Span::styled("  │ ", resolved_style),
+                        Span::raw("  "),
+                        Span::styled("│ ", resolved_style),
                         Span::styled(
                             format!("{}: ", comment.author),
                             if thread.is_resolved { Style::default().fg(Color::DarkGray) } else { Style::default().fg(Color::Cyan) },
@@ -841,15 +922,58 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                             comment.body.lines().next().unwrap_or(""),
                             c_style,
                         ),
-                    ]));
+                    ]).style(line_bg_style));
                     for extra in comment.body.lines().skip(1).take(4) {
                         lines.push(Line::from(vec![
-                            Span::styled("  │   ", resolved_style),
+                            Span::raw("  "),
+                            Span::styled("│   ", resolved_style),
                             Span::styled(extra, c_style),
-                        ]));
+                        ]).style(line_bg_style));
                     }
                 }
-                lines.push(Line::from(Span::styled("  └─", resolved_style)));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("└─", resolved_style),
+                ]).style(line_bg_style));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+
+    // File-level Claude comments (line not in diff)
+    if scroll == 0 && !dv.file_level_claude.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  \u{f12a} Claude comments (file-level)",
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        )));
+        let comment_bg = Color::Rgb(20, 15, 30);
+        for &ci in &dv.file_level_claude {
+            if let Some(cc) = dv.claude_comments.get(ci) {
+                let (label, frame_style) = match cc.accepted {
+                    None => ("\u{f12a} Claude", Style::default().fg(Color::Magenta)),
+                    Some(true) => ("\u{f00c} Accepted", Style::default().fg(Color::Green)),
+                    Some(false) => ("\u{f00d} Discarded", Style::default().fg(Color::DarkGray)),
+                };
+                let body_style = match cc.accepted {
+                    Some(false) => Style::default().fg(Color::DarkGray),
+                    _ => Style::default().fg(Color::Rgb(180, 180, 200)),
+                };
+                let line_hint = if cc.line > 0 { format!(" (line {})", cc.line) } else { String::new() };
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default().bg(comment_bg)),
+                    Span::styled(format!("┌─ {}{} ", label, line_hint), frame_style.bg(comment_bg)),
+                ]));
+                for body_line in cc.body.lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default().bg(comment_bg)),
+                        Span::styled("│ ", frame_style.bg(comment_bg)),
+                        Span::styled(body_line, body_style.bg(comment_bg)),
+                    ]));
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default().bg(comment_bg)),
+                    Span::styled("└─", frame_style.bg(comment_bg)),
+                ]));
             }
         }
         lines.push(Line::from(""));
@@ -868,36 +992,48 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
             _ => "          ".to_string(),
         };
 
-        let line_style = match dl.kind {
-            LineKind::Added => Style::default().fg(Color::Green),
-            LineKind::Removed => Style::default().fg(Color::Red),
-            LineKind::Hunk => Style::default().fg(Color::Cyan),
-            LineKind::Meta => Style::default().fg(Color::DarkGray),
-            LineKind::Context => Style::default().fg(Color::White),
+        let (line_num_color, sign_color, content_color, line_bg) = match dl.kind {
+            LineKind::Added => (Color::Rgb(80, 160, 80), Color::Rgb(80, 160, 80), Color::White, Color::Rgb(20, 60, 20)),
+            LineKind::Removed => (Color::Red, Color::Red, Color::White, Color::Rgb(70, 15, 15)),
+            LineKind::Hunk => (Color::DarkGray, Color::Cyan, Color::Cyan, Color::Reset),
+            LineKind::Meta => (Color::DarkGray, Color::DarkGray, Color::DarkGray, Color::Reset),
+            LineKind::Context => (Color::DarkGray, Color::White, Color::White, Color::Reset),
         };
 
         let bg = if is_cursor {
             Color::Rgb(30, 30, 50)
         } else {
-            Color::Reset
+            line_bg
         };
 
-        let mut spans = vec![
-            Span::styled(line_num, Style::default().fg(Color::DarkGray).bg(bg)),
-        ];
-
         // Comment indicators in gutter
-        if has_thread {
-            spans.push(Span::styled("\u{f075}", Style::default().fg(Color::Yellow).bg(bg)));
+        let comment_indicator = if has_thread {
+            Span::styled("\u{f075}", Style::default().fg(Color::Yellow).bg(bg))
         } else if has_claude {
-            spans.push(Span::styled("\u{f12a}", Style::default().fg(Color::Magenta).bg(bg)));
+            Span::styled("\u{f12a}", Style::default().fg(Color::Magenta).bg(bg))
+        } else {
+            Span::styled(" ", Style::default().bg(bg))
+        };
+
+        // Split +/- sign from content; place sign right after line numbers
+        let content = &dl.content;
+        let mut spans = vec![
+            Span::styled(line_num, Style::default().fg(line_num_color).bg(bg)),
+        ];
+        if (dl.kind == LineKind::Added || dl.kind == LineKind::Removed) && !content.is_empty() {
+            let (sign, rest) = content.split_at(1);
+            spans.push(Span::styled(sign, Style::default().fg(sign_color).bg(bg)));
+            spans.push(comment_indicator);
+            spans.push(Span::styled("  ", Style::default().bg(bg)));
+            spans.push(Span::styled(rest, Style::default().fg(content_color).bg(bg)));
         } else {
             spans.push(Span::styled(" ", Style::default().bg(bg)));
+            spans.push(comment_indicator);
+            spans.push(Span::styled("  ", Style::default().bg(bg)));
+            spans.push(Span::styled(content, Style::default().fg(content_color).bg(bg)));
         }
-        spans.push(Span::styled(" ", Style::default().bg(bg)));
-        spans.push(Span::styled(&dl.content, line_style.bg(bg)));
 
-        lines.push(Line::from(spans));
+        lines.push(Line::from(spans).style(Style::default().bg(bg)));
 
         // Render inline comments after the line (skip file-level ones, shown at top)
         if let Some(thread_indices) = dv.line_threads.get(&li) {
@@ -906,22 +1042,27 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                     continue;
                 }
                 if let Some(thread) = dv.threads.get(ti) {
+                    let thread_bg = if thread.is_resolved {
+                        Color::Reset
+                    } else {
+                        Color::Rgb(60, 45, 10)
+                    };
+                    let line_bg_style = Style::default().bg(thread_bg);
                     let resolved_style = if thread.is_resolved {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(Color::Green)
                     } else {
                         Style::default().fg(Color::Yellow)
                     };
                     let resolve_icon = if thread.is_resolved { " \u{f00c}" } else { "" };
                     lines.push(Line::from(vec![
                         Span::raw("          "),
-                        Span::styled("┌─ \u{f075} Thread ", resolved_style),
-                        Span::styled(resolve_icon, Style::default().fg(Color::Green)),
-                    ]));
+                        Span::styled(format!("┌─ \u{f075} Thread{} ", resolve_icon), resolved_style),
+                    ]).style(line_bg_style));
                     for comment in &thread.comments {
                         let c_style = if thread.is_resolved {
                             Style::default().fg(Color::DarkGray)
                         } else {
-                            Style::default().fg(Color::White)
+                            Style::default().fg(Color::Rgb(200, 190, 170))
                         };
                         lines.push(Line::from(vec![
                             Span::raw("          "),
@@ -938,14 +1079,14 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                                 comment.body.lines().next().unwrap_or(""),
                                 c_style,
                             ),
-                        ]));
+                        ]).style(line_bg_style));
                         // Show additional lines
                         for extra in comment.body.lines().skip(1).take(3) {
                             lines.push(Line::from(vec![
                                 Span::raw("          "),
                                 Span::styled("│   ", resolved_style),
                                 Span::styled(extra, c_style),
-                            ]));
+                            ]).style(line_bg_style));
                         }
                     }
                     // Show draft replies
@@ -953,44 +1094,86 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                         if draft.in_reply_to_thread == Some(ti) {
                             lines.push(Line::from(vec![
                                 Span::raw("          "),
-                                Span::styled("│ ", Style::default().fg(Color::Green)),
+                                Span::styled("│ ", resolved_style),
                                 Span::styled(
-                                    format!("(draft) {}", draft.body),
-                                    Style::default().fg(Color::Green),
+                                    "(draft) ",
+                                    Style::default().fg(Color::Rgb(180, 140, 60)).add_modifier(Modifier::ITALIC),
                                 ),
-                            ]));
+                                Span::styled(
+                                    &draft.body,
+                                    Style::default().fg(Color::Rgb(200, 190, 170)),
+                                ),
+                            ]).style(line_bg_style));
                         }
                     }
                     lines.push(Line::from(vec![
                         Span::raw("          "),
                         Span::styled("└─", resolved_style),
-                    ]));
+                    ]).style(line_bg_style));
                 }
             }
         }
 
-        // Render Claude comments
+        // Render Claude comments (framed like threads)
         if let Some(claude_indices) = dv.line_claude.get(&li) {
             for &ci in claude_indices {
                 if let Some(cc) = dv.claude_comments.get(ci) {
-                    let (label, style) = match cc.accepted {
+                    let (label, frame_style) = match cc.accepted {
                         None => ("\u{f12a} Claude", Style::default().fg(Color::Magenta)),
                         Some(true) => ("\u{f00c} Accepted", Style::default().fg(Color::Green)),
                         Some(false) => ("\u{f00d} Discarded", Style::default().fg(Color::DarkGray)),
                     };
-                    lines.push(Line::from(vec![
-                        Span::raw("          "),
-                        Span::styled(format!("  {} ", label), style),
-                    ]));
                     let body_style = match cc.accepted {
                         Some(false) => Style::default().fg(Color::DarkGray),
-                        _ => Style::default().fg(Color::White),
+                        _ => Style::default().fg(Color::Rgb(180, 180, 200)),
                     };
-                    for body_line in cc.body.lines().take(5) {
-                        lines.push(Line::from(vec![
-                            Span::raw("          "),
-                            Span::styled(format!("  {}", body_line), body_style),
-                        ]));
+                    let comment_bg = Color::Rgb(20, 15, 30);
+                    lines.push(Line::from(vec![
+                        Span::styled("          ", Style::default().bg(comment_bg)),
+                        Span::styled(format!("┌─ {} ", label), frame_style.bg(comment_bg)),
+                    ]));
+                    // Wrap body text to available width
+                    let wrap_width = area.width.saturating_sub(16) as usize;
+                    for body_line in cc.body.lines() {
+                        let mut remaining = body_line;
+                        loop {
+                            let (chunk, rest) = if remaining.len() > wrap_width {
+                                // Find a good break point
+                                let break_at = remaining[..wrap_width]
+                                    .rfind(' ')
+                                    .unwrap_or(wrap_width);
+                                (&remaining[..break_at], remaining[break_at..].trim_start())
+                            } else {
+                                (remaining, "")
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled("          ", Style::default().bg(comment_bg)),
+                                Span::styled("│ ", frame_style.bg(comment_bg)),
+                                Span::styled(chunk, body_style.bg(comment_bg)),
+                            ]));
+                            if rest.is_empty() { break; }
+                            remaining = rest;
+                        }
+                    }
+                    match cc.accepted {
+                        None => {
+                            lines.push(Line::from(vec![
+                                Span::styled("          ", Style::default().bg(comment_bg)),
+                                Span::styled("└─", frame_style.bg(comment_bg)),
+                                Span::styled(" y ", Style::default().fg(Color::Yellow).bg(comment_bg)),
+                                Span::styled("accept │ ", Style::default().fg(Color::DarkGray).bg(comment_bg)),
+                                Span::styled("e ", Style::default().fg(Color::Yellow).bg(comment_bg)),
+                                Span::styled("edit │ ", Style::default().fg(Color::DarkGray).bg(comment_bg)),
+                                Span::styled("x ", Style::default().fg(Color::Yellow).bg(comment_bg)),
+                                Span::styled("discard", Style::default().fg(Color::DarkGray).bg(comment_bg)),
+                            ]));
+                        }
+                        _ => {
+                            lines.push(Line::from(vec![
+                                Span::styled("          ", Style::default().bg(comment_bg)),
+                                Span::styled("└─", frame_style.bg(comment_bg)),
+                            ]));
+                        }
                     }
                 }
             }
@@ -999,16 +1182,25 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
         // Draft new comments (not replies)
         for draft in &dv.draft_comments {
             if draft.in_reply_to_thread.is_none() && draft.file == file.path {
-                if let Some(new_ln) = dl.new_line {
-                    if draft.line == new_ln {
+                let matches = dl.new_line == Some(draft.line)
+                    || dl.old_line == Some(draft.line);
+                if matches {
+                    let draft_bg = Color::Rgb(15, 25, 15);
+                    lines.push(Line::from(vec![
+                        Span::styled("          ", Style::default().bg(draft_bg)),
+                        Span::styled("┌─ \u{f040} Draft ", Style::default().fg(Color::Green).bg(draft_bg)),
+                    ]));
+                    for body_line in draft.body.lines() {
                         lines.push(Line::from(vec![
-                            Span::raw("          "),
-                            Span::styled(
-                                format!("  \u{f040} (draft) {}", draft.body),
-                                Style::default().fg(Color::Green),
-                            ),
+                            Span::styled("          ", Style::default().bg(draft_bg)),
+                            Span::styled("│ ", Style::default().fg(Color::Green).bg(draft_bg)),
+                            Span::styled(body_line, Style::default().fg(Color::Rgb(180, 200, 180)).bg(draft_bg)),
                         ]));
                     }
+                    lines.push(Line::from(vec![
+                        Span::styled("          ", Style::default().bg(draft_bg)),
+                        Span::styled("└─", Style::default().fg(Color::Green).bg(draft_bg)),
+                    ]));
                 }
             }
         }
@@ -1024,11 +1216,27 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
-fn draw_input_overlay(f: &mut Frame, dv: &DiffView, area: Rect) {
-    let w = 60u16.min(area.width.saturating_sub(4));
-    let h = 5u16;
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = area.height.saturating_sub(h + 2);
+fn draw_input_overlay(f: &mut Frame, dv: &DiffView, diff_area: Rect) {
+    // Position below the cursor line within the diff pane
+    let inner_top = diff_area.y + 1; // account for border
+    let inner_height = diff_area.height.saturating_sub(2) as usize;
+    let scroll = if dv.cursor_line >= dv.scroll + inner_height {
+        dv.cursor_line.saturating_sub(inner_height - 1)
+    } else if dv.cursor_line < dv.scroll {
+        dv.cursor_line
+    } else {
+        dv.scroll
+    };
+    let cursor_screen_y = inner_top + (dv.cursor_line.saturating_sub(scroll)) as u16 + 1;
+
+    let h = 6u16;
+    let w = diff_area.width.saturating_sub(4).min(80);
+    let x = diff_area.x + 2;
+    let y = if cursor_screen_y + h + 1 < diff_area.y + diff_area.height {
+        cursor_screen_y
+    } else {
+        cursor_screen_y.saturating_sub(h + 1)
+    };
     let popup_area = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, popup_area);
@@ -1036,6 +1244,7 @@ fn draw_input_overlay(f: &mut Frame, dv: &DiffView, area: Rect) {
     let title = match &dv.input_mode {
         Some(crate::diff_view::InputMode::NewComment { .. }) => " New Comment ",
         Some(crate::diff_view::InputMode::Reply { .. }) => " Reply ",
+        Some(crate::diff_view::InputMode::EditClaude { .. }) => " Edit Claude Comment ",
         None => " Comment ",
     };
 
@@ -1045,8 +1254,10 @@ fn draw_input_overlay(f: &mut Frame, dv: &DiffView, area: Rect) {
         .title_bottom(" Enter submit │ Esc cancel ")
         .border_style(Style::default().fg(Color::Green));
 
-    let text = format!("▎{}", dv.input_buffer);
-    let paragraph = Paragraph::new(text).block(block);
+    let text = format!(" ▎{}", dv.input_buffer);
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(paragraph, popup_area);
 }
 
@@ -1056,9 +1267,20 @@ fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, area: Rect) {
     let claude_pending = dv.claude_comments.iter().filter(|c| c.accepted.is_none()).count();
     let drafts = dv.draft_comments.len();
 
+    if let Some(status) = &dv.submit_status {
+        let color = if status.starts_with("Submit failed") { Color::Red } else { Color::Green };
+        let bar = Paragraph::new(Span::styled(
+            format!(" {} │ press any key to continue", status),
+            Style::default().fg(color),
+        ));
+        f.render_widget(bar, area);
+        return;
+    }
+
+    let submit_hint = if drafts > 0 { " │ S submit" } else { "" };
     let info = format!(
-        " ↑↓ scroll │ Tab focus │ {{}}/{{}} resize │ n/N comments │ a add │ r reply │ y/x claude │ q back {}│ threads:{} claude:{} drafts:{}",
-        loading, threads, claude_pending, drafts
+        " ↑↓ scroll │ Tab focus │ n/N comments │ a add │ r reply │ c claude │ y/e/x accept/edit/discard{} │ q back {}│ threads:{} claude:{} drafts:{}",
+        submit_hint, loading, threads, claude_pending, drafts
     );
 
     let bar = Paragraph::new(Span::styled(info, Style::default().fg(Color::DarkGray)));

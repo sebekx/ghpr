@@ -17,11 +17,17 @@ pub struct DiffView {
     pub pr_number: u64,
     pub repo_name: String,
     pub loading_review: bool,
+    pub review_output: String,
+    pub review_scroll: u16,
+    /// Status message from submit action
+    pub submit_status: Option<String>,
     /// Precomputed comment positions for current file: diff_line_index -> list of thread indices
     pub line_threads: HashMap<usize, Vec<usize>>,
     pub line_claude: HashMap<usize, Vec<usize>>,
     /// File-level threads (no line or line not in diff) for current file
     pub file_level_threads: Vec<usize>,
+    /// File-level Claude comments (line not in diff) for current file
+    pub file_level_claude: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +85,7 @@ pub struct DraftComment {
 pub enum InputMode {
     NewComment { diff_line: usize },
     Reply { thread_idx: usize },
+    EditClaude { claude_idx: usize },
 }
 
 impl DiffView {
@@ -99,9 +106,13 @@ impl DiffView {
             pr_number,
             repo_name,
             loading_review: false,
+            review_output: String::new(),
+            review_scroll: 0,
+            submit_status: None,
             line_threads: HashMap::new(),
             line_claude: HashMap::new(),
             file_level_threads: Vec::new(),
+            file_level_claude: Vec::new(),
         };
         view.rebuild_line_maps();
         view
@@ -134,6 +145,7 @@ impl DiffView {
         self.line_threads.clear();
         self.line_claude.clear();
         self.file_level_threads.clear();
+        self.file_level_claude.clear();
 
         let Some(file) = self.files.get(self.selected_file) else {
             return;
@@ -194,11 +206,29 @@ impl DiffView {
             if cc.file != file.path {
                 continue;
             }
+            let mut found = false;
+            // Try new_line first
             for (li, dl) in file.lines.iter().enumerate() {
                 if dl.new_line == Some(cc.line) {
                     self.line_claude.entry(li).or_default().push(ci);
+                    found = true;
                     break;
                 }
+            }
+            // Fallback: try old_line
+            if !found {
+                for (li, dl) in file.lines.iter().enumerate() {
+                    if dl.old_line == Some(cc.line) {
+                        self.line_claude.entry(li).or_default().push(ci);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            // Still not found — show as file-level
+            if !found {
+                self.file_level_claude.push(ci);
+                self.line_claude.entry(0).or_default().push(ci);
             }
         }
     }
@@ -351,11 +381,21 @@ impl DiffView {
     }
 
     pub fn start_reply(&mut self) {
-        // Find the thread at or near cursor_line
-        if let Some(thread_indices) = self.line_threads.get(&self.cursor_line) {
-            if let Some(&ti) = thread_indices.first() {
-                self.input_mode = Some(InputMode::Reply { thread_idx: ti });
-                self.input_buffer.clear();
+        // Find the nearest thread within ±3 lines
+        for offset in 0..=3 {
+            let lines_to_check: Vec<usize> = if offset == 0 {
+                vec![self.cursor_line]
+            } else {
+                vec![self.cursor_line.saturating_sub(offset), self.cursor_line + offset]
+            };
+            for li in lines_to_check {
+                if let Some(thread_indices) = self.line_threads.get(&li) {
+                    if let Some(&ti) = thread_indices.first() {
+                        self.input_mode = Some(InputMode::Reply { thread_idx: ti });
+                        self.input_buffer.clear();
+                        return;
+                    }
+                }
             }
         }
     }
@@ -373,11 +413,10 @@ impl DiffView {
 
         match &self.input_mode {
             Some(InputMode::NewComment { diff_line }) => {
-                let line_num = file
-                    .lines
-                    .get(*diff_line)
-                    .and_then(|l| l.new_line)
-                    .unwrap_or(0);
+                let dl = file.lines.get(*diff_line);
+                let line_num = dl.and_then(|l| l.new_line)
+                    .or_else(|| dl.and_then(|l| l.old_line))
+                    .unwrap_or(1);
                 self.draft_comments.push(DraftComment {
                     file: file.path.clone(),
                     line: line_num,
@@ -403,6 +442,18 @@ impl DiffView {
                     in_reply_to_thread: Some(*thread_idx),
                 });
             }
+            Some(InputMode::EditClaude { claude_idx }) => {
+                if let Some(cc) = self.claude_comments.get_mut(*claude_idx) {
+                    cc.body = self.input_buffer.clone();
+                    cc.accepted = Some(true);
+                    self.draft_comments.push(DraftComment {
+                        file: cc.file.clone(),
+                        line: cc.line,
+                        body: cc.body.clone(),
+                        in_reply_to_thread: None,
+                    });
+                }
+            }
             None => {}
         }
         self.input_buffer.clear();
@@ -414,27 +465,70 @@ impl DiffView {
         self.input_buffer.clear();
     }
 
-    /// Accept Claude comment at cursor
-    pub fn accept_claude_at_cursor(&mut self) {
-        if let Some(indices) = self.line_claude.get(&self.cursor_line).cloned() {
-            for &ci in &indices {
-                if let Some(cc) = self.claude_comments.get_mut(ci) {
-                    if cc.accepted.is_none() {
-                        cc.accepted = Some(true);
+    /// Find nearest Claude comment index within ±3 lines of cursor
+    fn find_nearest_claude(&self) -> Vec<usize> {
+        for offset in 0..=3 {
+            let lines_to_check: Vec<usize> = if offset == 0 {
+                vec![self.cursor_line]
+            } else {
+                let mut v = Vec::new();
+                v.push(self.cursor_line.saturating_sub(offset));
+                v.push(self.cursor_line + offset);
+                v
+            };
+            for li in lines_to_check {
+                if let Some(indices) = self.line_claude.get(&li) {
+                    let pending: Vec<usize> = indices.iter()
+                        .filter(|&&ci| self.claude_comments.get(ci).map_or(false, |c| c.accepted.is_none()))
+                        .copied()
+                        .collect();
+                    if !pending.is_empty() {
+                        return pending;
                     }
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Accept Claude comment at/near cursor — marks as accepted and adds as draft comment
+    pub fn accept_claude_at_cursor(&mut self) {
+        let indices = self.find_nearest_claude();
+        for ci in indices {
+            if let Some(cc) = self.claude_comments.get_mut(ci) {
+                if cc.accepted.is_none() {
+                    cc.accepted = Some(true);
+                    self.draft_comments.push(DraftComment {
+                        file: cc.file.clone(),
+                        line: cc.line,
+                        body: cc.body.clone(),
+                        in_reply_to_thread: None,
+                    });
                 }
             }
         }
     }
 
-    /// Discard Claude comment at cursor
+    /// Discard Claude comment at/near cursor
     pub fn discard_claude_at_cursor(&mut self) {
-        if let Some(indices) = self.line_claude.get(&self.cursor_line).cloned() {
-            for &ci in &indices {
-                if let Some(cc) = self.claude_comments.get_mut(ci) {
-                    if cc.accepted.is_none() {
-                        cc.accepted = Some(false);
-                    }
+        let indices = self.find_nearest_claude();
+        for ci in indices {
+            if let Some(cc) = self.claude_comments.get_mut(ci) {
+                if cc.accepted.is_none() {
+                    cc.accepted = Some(false);
+                }
+            }
+        }
+    }
+
+    /// Edit Claude comment at/near cursor — opens input with existing text
+    pub fn edit_claude_at_cursor(&mut self) {
+        let indices = self.find_nearest_claude();
+        if let Some(&ci) = indices.first() {
+            if let Some(cc) = self.claude_comments.get(ci) {
+                if cc.accepted.is_none() {
+                    self.input_buffer = cc.body.clone();
+                    self.input_mode = Some(InputMode::EditClaude { claude_idx: ci });
                 }
             }
         }

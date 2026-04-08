@@ -88,21 +88,6 @@ fn run_app(
 
                 // --- Modal layers (highest priority first) ---
 
-                // Review popup
-                if app.review_popup.is_some() {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => app.close_review_popup(),
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if let Some(p) = &mut app.review_popup { p.scroll = p.scroll.saturating_sub(3); }
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if let Some(p) = &mut app.review_popup { p.scroll = p.scroll.saturating_add(3); }
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
                 // Help popup
                 if app.show_help {
                     app.show_help = false;
@@ -135,6 +120,35 @@ fn run_app(
 
                 // --- Diff view mode ---
                 if let Some(dv) = &mut app.diff_view {
+                    // Clear submit status on any key
+                    dv.submit_status = None;
+
+                    // Review output popup — captures keys while visible
+                    if dv.loading_review || !dv.review_output.is_empty() {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                dv.review_output.clear();
+                                if dv.loading_review {
+                                    // Can't cancel the process, but hide the popup
+                                    // Output will still be processed in background
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                dv.review_scroll = dv.review_scroll.saturating_sub(3);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                dv.review_scroll = dv.review_scroll.saturating_add(3);
+                            }
+                            _ => {
+                                if !dv.loading_review {
+                                    // Review done, any other key closes
+                                    dv.review_output.clear();
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
                     // Input mode (typing a comment)
                     if dv.input_mode.is_some() {
                         match key.code {
@@ -229,6 +243,19 @@ fn run_app(
                         KeyCode::Char('r') => dv.start_reply(),
                         KeyCode::Char('y') => dv.accept_claude_at_cursor(),
                         KeyCode::Char('x') => dv.discard_claude_at_cursor(),
+                        KeyCode::Char('e') => dv.edit_claude_at_cursor(),
+                        KeyCode::Char('c') => {
+                            // Run structured Claude review into diff view
+                            if let (Some(repo), Some(pr)) = (app.selected_repo_name(), app.selected_pr().cloned()) {
+                                if let Some(dv) = &mut app.diff_view {
+                                    dv.loading_review = true;
+                                }
+                                app.run_structured_review_bg(&repo, &pr);
+                            }
+                        }
+                        KeyCode::Char('S') => {
+                            app.submit_drafts();
+                        }
                         KeyCode::Char('?') => { app.show_help = true; }
                         _ => {}
                     }
@@ -246,7 +273,6 @@ fn run_app(
                         app.open_diff_view(false);
                     }
                     KeyCode::Char('A') => app.show_approve_popup(),
-                    KeyCode::Char('c') => app.request_claude_review(),
                     KeyCode::Char('a') => app.toggle_assigned(),
                     KeyCode::Char('r') => app.refresh(),
                     KeyCode::Char('o') => {

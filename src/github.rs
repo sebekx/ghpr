@@ -17,6 +17,8 @@ pub struct PullRequest {
     pub updated_at: DateTime<Utc>,
     pub html_url: String,
     #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
     pub requested_reviewers: Vec<GhUser>,
     pub head: GitRef,
     pub base: GitRef,
@@ -26,6 +28,10 @@ pub struct PullRequest {
     pub deletions: u64,
     #[serde(default)]
     pub changed_files: u64,
+    #[serde(default)]
+    pub mergeable: Option<bool>,
+    #[serde(default)]
+    pub mergeable_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -416,6 +422,78 @@ impl GithubClient {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("GitHub API error {}: {}", status, text);
         }
+        Ok(())
+    }
+
+    /// Submit a review with new comments and reply to existing threads
+    pub async fn submit_review(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        new_comments: Vec<(String, u64, String)>, // (path, line, body)
+        replies: Vec<(u64, String)>,               // (comment_id, body)
+    ) -> Result<()> {
+        // Submit new comments as a review
+        if !new_comments.is_empty() {
+            let url = format!(
+                "https://api.github.com/repos/{}/pulls/{}/reviews",
+                repo, pr_number
+            );
+            let comments: Vec<serde_json::Value> = new_comments
+                .iter()
+                .map(|(path, line, body)| {
+                    serde_json::json!({
+                        "path": path,
+                        "line": line,
+                        "body": body,
+                    })
+                })
+                .collect();
+            let body = serde_json::json!({
+                "event": "COMMENT",
+                "comments": comments,
+            });
+            let resp = self
+                .client
+                .post(&url)
+                .header(reqwest::header::USER_AGENT, "ghpr-tui")
+                .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", self.token))
+                .header(reqwest::header::ACCEPT, "application/vnd.github.v3+json")
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to submit review")?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("GitHub API error {}: {}", status, text);
+            }
+        }
+
+        // Submit replies individually
+        for (comment_id, body) in &replies {
+            let url = format!(
+                "https://api.github.com/repos/{}/pulls/{}/comments/{}/replies",
+                repo, pr_number, comment_id
+            );
+            let payload = serde_json::json!({ "body": body });
+            let resp = self
+                .client
+                .post(&url)
+                .header(reqwest::header::USER_AGENT, "ghpr-tui")
+                .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", self.token))
+                .header(reqwest::header::ACCEPT, "application/vnd.github.v3+json")
+                .json(&payload)
+                .send()
+                .await
+                .context("Failed to submit reply")?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("GitHub API error {}: {}", status, text);
+            }
+        }
+
         Ok(())
     }
 

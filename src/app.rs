@@ -23,11 +23,11 @@ pub enum BgMsg {
     Error(String),
     StatusesLoaded(Vec<((String, u64), PrStatus)>),
     DiffLoaded(String),
-    ReviewLoaded(String),
-    ReviewProgress(String),
     ThreadsLoaded(Vec<crate::github::ReviewThread>),
     ClaudeReviewParsed(Vec<ClaudeComment>),
+    ClaudeReviewOutput(String),
     ApproveResult(Result<(), String>),
+    SubmitResult(Result<usize, String>),
 }
 
 /// A flattened PR entry with its repo name
@@ -62,7 +62,6 @@ pub struct App {
     pub bg_rx: mpsc::UnboundedReceiver<BgMsg>,
     pub bg_tx: mpsc::UnboundedSender<BgMsg>,
     status_requested: std::collections::HashSet<String>,
-    pub review_popup: Option<ReviewPopup>,
     pub show_help: bool,
     pub diff_view: Option<DiffView>,
     pub tree_index: usize,
@@ -90,12 +89,6 @@ pub enum DiffFocus {
 }
 
 
-pub struct ReviewPopup {
-    pub title: String,
-    pub content: String,
-    pub scroll: u16,
-    pub loading: bool,
-}
 
 impl App {
     pub fn new(client: GithubClient) -> Self {
@@ -123,7 +116,6 @@ impl App {
             bg_rx,
             bg_tx,
             status_requested: std::collections::HashSet::new(),
-            review_popup: None,
             show_help: false,
             diff_view: None,
             tree_index: 0,
@@ -397,113 +389,6 @@ impl App {
         });
     }
 
-    pub fn request_claude_review(&mut self) {
-        let Some(repo_name) = self.selected_repo_name() else {
-            return;
-        };
-        let Some(pr) = self.selected_pr() else {
-            return;
-        };
-        let pr_number = pr.number;
-        let title = format!("Claude Review — #{} {}", pr.number, pr.title);
-
-        self.review_popup = Some(ReviewPopup {
-            title,
-            content: "Running claude /review-pr …\n".to_string(),
-            scroll: 0,
-            loading: true,
-        });
-
-        let tx = self.bg_tx.clone();
-        let repo = repo_name.clone();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            use tokio::process::Command;
-
-            let pr_url = format!("https://github.com/{}/pull/{}", repo, pr_number);
-            let prompt = format!("/review-pr {}", pr_url);
-
-            let result = Command::new("claude")
-                .args([
-                    "-p",
-                    &prompt,
-                    "--output-format",
-                    "stream-json",
-                    "--verbose",
-                    "--include-partial-messages",
-                ])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-
-            match result {
-                Ok(mut child) => {
-                    if let Some(stdout) = child.stdout.take() {
-                        let reader = BufReader::new(stdout);
-                        let mut lines = reader.lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                                match val.get("type").and_then(|t| t.as_str()) {
-                                    Some("stream_event") => {
-                                        if let Some(delta_text) = val
-                                            .pointer("/event/delta/text")
-                                            .and_then(|t| t.as_str())
-                                        {
-                                            let _ = tx.send(BgMsg::ReviewProgress(
-                                                delta_text.to_string(),
-                                            ));
-                                        }
-                                        if let Some(tool_name) = val
-                                            .pointer("/event/content_block/name")
-                                            .and_then(|t| t.as_str())
-                                        {
-                                            let _ = tx.send(BgMsg::ReviewProgress(format!(
-                                                "\n⚙ {} ",
-                                                tool_name
-                                            )));
-                                        }
-                                        if let Some(input_json) = val
-                                            .pointer("/event/delta/partial_json")
-                                            .and_then(|t| t.as_str())
-                                        {
-                                            let _ = tx.send(BgMsg::ReviewProgress(
-                                                input_json.to_string(),
-                                            ));
-                                        }
-                                    }
-                                    Some("result") => {
-                                        if let Some(result_text) =
-                                            val.get("result").and_then(|r| r.as_str())
-                                        {
-                                            let _ = tx.send(BgMsg::ReviewLoaded(
-                                                result_text.to_string(),
-                                            ));
-                                            break;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-
-                    let _ = child.wait().await;
-                    let _ = tx.send(BgMsg::ReviewLoaded(String::new()));
-                }
-                Err(e) => {
-                    let _ = tx.send(BgMsg::ReviewLoaded(format!(
-                        "Failed to run `claude`: {}\n\nMake sure Claude Code CLI is installed:\n  npm install -g @anthropic-ai/claude-code",
-                        e
-                    )));
-                }
-            }
-        });
-    }
-
-    pub fn close_review_popup(&mut self) {
-        self.review_popup = None;
-    }
-
     pub fn show_approve_popup(&mut self) {
         let Some(repo_name) = self.selected_repo_name() else { return };
         let Some(pr) = self.selected_pr() else { return };
@@ -540,6 +425,68 @@ impl App {
         });
     }
 
+    /// Submit all draft comments to GitHub
+    pub fn submit_drafts(&mut self) {
+        let Some(dv) = &self.diff_view else { return };
+        if dv.draft_comments.is_empty() { return; }
+
+        let drafts = dv.draft_comments.clone();
+        let threads = dv.threads.clone();
+        let repo = dv.repo_name.clone();
+        let pr_number = dv.pr_number;
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+
+        let count = drafts.len();
+
+        tokio::spawn(async move {
+            // Separate new comments from replies
+            let mut new_comments: Vec<(String, u64, String)> = Vec::new();
+            let mut replies: Vec<(u64, String)> = Vec::new();
+
+            for draft in &drafts {
+                if let Some(thread_idx) = draft.in_reply_to_thread {
+                    // Reply to existing thread — use first comment's ID
+                    if let Some(thread) = threads.get(thread_idx) {
+                        if let Some(first) = thread.comments.first() {
+                            replies.push((first.id, draft.body.clone()));
+                        }
+                    }
+                } else {
+                    new_comments.push((draft.file.clone(), draft.line, draft.body.clone()));
+                }
+            }
+
+            match client.submit_review(&repo, pr_number, new_comments, replies).await {
+                Ok(()) => { let _ = tx.send(BgMsg::SubmitResult(Ok(count))); }
+                Err(e) => { let _ = tx.send(BgMsg::SubmitResult(Err(e.to_string()))); }
+            }
+        });
+    }
+
+    /// Fetch review threads in background
+    fn fetch_threads(&self, repo_name: &str, pr: &PullRequest) {
+        let parts: Vec<&str> = repo_name.split('/').collect();
+        if parts.len() == 2 {
+            let client = self.client.clone();
+            let tx = self.bg_tx.clone();
+            let owner = parts[0].to_string();
+            let repo_short = parts[1].to_string();
+            let repo_full = repo_name.to_string();
+            let pr_num = pr.number;
+            let pr_clone = pr.clone();
+            tokio::spawn(async move {
+                let threads = match client.fetch_review_threads(&owner, &repo_short, pr_num).await {
+                    Ok(t) if !t.is_empty() => t,
+                    _ => {
+                        client.build_threads_from_rest(&repo_full, &pr_clone).await
+                    }
+                };
+                let _ = tx.send(BgMsg::ThreadsLoaded(threads));
+            });
+        }
+    }
+
     /// Open diff view (loads diff, threads, optionally Claude review)
     pub fn open_diff_view(&mut self, with_claude: bool) {
         self.diff_view = None;
@@ -555,28 +502,7 @@ impl App {
         self.diff_pr_key = None;
         self.request_diff();
 
-        // Fetch threads in background (GraphQL with REST fallback)
-        let parts: Vec<&str> = repo_name.split('/').collect();
-        if parts.len() == 2 {
-            let client = self.client.clone();
-            let tx = self.bg_tx.clone();
-            let owner = parts[0].to_string();
-            let repo_short = parts[1].to_string();
-            let repo_full = repo_name.clone();
-            let pr_num = pr.number;
-            let pr_clone = pr.clone();
-            tokio::spawn(async move {
-                // Try GraphQL first
-                let threads = match client.fetch_review_threads(&owner, &repo_short, pr_num).await {
-                    Ok(t) if !t.is_empty() => t,
-                    _ => {
-                        // Fallback: build threads from REST review comments
-                        client.build_threads_from_rest(&repo_full, &pr_clone).await
-                    }
-                };
-                let _ = tx.send(BgMsg::ThreadsLoaded(threads));
-            });
-        }
+        self.fetch_threads(&repo_name, &pr);
 
         // Run Claude structured review if requested
         if with_claude {
@@ -587,82 +513,131 @@ impl App {
         self.active_tab = Tab::Diff;
     }
 
+    /// Public wrapper to trigger structured Claude review from diff view
+    pub fn run_structured_review_bg(&self, repo_name: &str, pr: &PullRequest) {
+        self.run_structured_claude_review(repo_name, pr);
+    }
+
     fn run_structured_claude_review(&self, repo_name: &str, pr: &PullRequest) {
         let tx = self.bg_tx.clone();
-        let pr_url = format!("https://github.com/{}/pull/{}", repo_name, pr.number);
+        let repo = repo_name.to_string();
+        let pr_number = pr.number;
 
         tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
             use tokio::process::Command;
 
-            let prompt = format!(
-                r#"Review this GitHub pull request: {}
-Analyze the code changes and provide review comments.
-Output ONLY a JSON array where each element has:
-- "file": the file path
-- "line": line number in the new file
-- "body": your review comment
-Example: [{{"file":"src/main.rs","line":42,"body":"Consider handling the error case here"}}]
-If no issues found, output an empty array: []"#,
-                pr_url
-            );
+            let pr_url = format!("https://github.com/{}/pull/{}", repo, pr_number);
+            let _ = tx.send(BgMsg::ClaudeReviewOutput(
+                format!("Running /review-pr {}...\n\n", pr_url),
+            ));
 
-            let schema = r#"{"type":"array","items":{"type":"object","properties":{"file":{"type":"string"},"line":{"type":"integer"},"body":{"type":"string"}},"required":["file","line","body"]}}"#;
+            let prompt = format!("/review-pr {}", pr_url);
+            let append_prompt = r#"IMPORTANT: After your review, you MUST end your response with a JSON block on a new line starting with ---GHPR_JSON--- followed by a JSON array of all your file-specific comments. Each element must have "file" (full path), "line" (line number in new file), "body" (your comment). Example:
+---GHPR_JSON---
+[{"file":"src/app.ts","line":42,"body":"Consider handling the error"}]
+If no comments, output:
+---GHPR_JSON---
+[]"#;
 
             let result = Command::new("claude")
-                .args(["-p", &prompt, "--json-schema", schema, "--output-format", "json"])
+                .args([
+                    "-p", &prompt,
+                    "--append-system-prompt", append_prompt,
+                    "--output-format", "stream-json",
+                    "--verbose",
+                    "--include-partial-messages",
+                    "--no-session-persistence",
+                    "--permission-mode", "bypassPermissions",
+                ])
+                .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
-                .output()
-                .await;
+                .spawn();
+
+            let mut review_text = String::new();
 
             match result {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    // Parse the JSON result
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                        // The --output-format json wraps in {"result": "..."}
-                        let json_str = val.get("result")
-                            .and_then(|r| r.as_str())
-                            .unwrap_or(&stdout);
-
-                        if let Ok(comments) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
-                            let parsed: Vec<ClaudeComment> = comments
-                                .iter()
-                                .filter_map(|c| {
-                                    Some(ClaudeComment {
-                                        file: c.get("file")?.as_str()?.to_string(),
-                                        line: c.get("line")?.as_u64()?,
-                                        body: c.get("body")?.as_str()?.to_string(),
-                                        accepted: None,
-                                    })
-                                })
-                                .collect();
-                            let _ = tx.send(BgMsg::ClaudeReviewParsed(parsed));
-                            return;
+                Ok(mut child) => {
+                    if let Some(stdout) = child.stdout.take() {
+                        let reader = BufReader::new(stdout);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                                match val.get("type").and_then(|t| t.as_str()) {
+                                    Some("stream_event") => {
+                                        if let Some(delta) = val
+                                            .pointer("/event/delta/text")
+                                            .and_then(|t| t.as_str())
+                                        {
+                                            review_text.push_str(delta);
+                                            let _ = tx.send(BgMsg::ClaudeReviewOutput(delta.to_string()));
+                                        }
+                                        if let Some(tool) = val
+                                            .pointer("/event/content_block/name")
+                                            .and_then(|t| t.as_str())
+                                        {
+                                            let _ = tx.send(BgMsg::ClaudeReviewOutput(
+                                                format!("\n⚙ {} ", tool),
+                                            ));
+                                        }
+                                        if let Some(input) = val
+                                            .pointer("/event/delta/partial_json")
+                                            .and_then(|t| t.as_str())
+                                        {
+                                            let _ = tx.send(BgMsg::ClaudeReviewOutput(input.to_string()));
+                                        }
+                                    }
+                                    Some("result") => {
+                                        if let Some(r) = val.get("result").and_then(|r| r.as_str()) {
+                                            if !r.is_empty() {
+                                                review_text = r.to_string();
+                                            }
+                                        }
+                                    }
+                                    Some("assistant") => {
+                                        if let Some(content) = val.pointer("/message/content") {
+                                            if let Some(arr) = content.as_array() {
+                                                for block in arr {
+                                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                                            if !text.is_empty() {
+                                                                review_text = text.to_string();
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                     }
-                    // Fallback: try direct parse
-                    if let Ok(comments) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
-                        let parsed: Vec<ClaudeComment> = comments
-                            .iter()
-                            .filter_map(|c| {
-                                Some(ClaudeComment {
-                                    file: c.get("file")?.as_str()?.to_string(),
-                                    line: c.get("line")?.as_u64()?,
-                                    body: c.get("body")?.as_str()?.to_string(),
-                                    accepted: None,
-                                })
-                            })
-                            .collect();
-                        let _ = tx.send(BgMsg::ClaudeReviewParsed(parsed));
-                    } else {
-                        let _ = tx.send(BgMsg::ClaudeReviewParsed(Vec::new()));
-                    }
+                    let _ = child.wait().await;
                 }
-                Err(_) => {
+                Err(e) => {
+                    let _ = tx.send(BgMsg::ClaudeReviewOutput(format!("Error: {}\n", e)));
                     let _ = tx.send(BgMsg::ClaudeReviewParsed(Vec::new()));
+                    return;
                 }
             }
+
+            // Parse JSON from the review output (after ---GHPR_JSON--- marker)
+            let parsed = if let Some(pos) = review_text.find("---GHPR_JSON---") {
+                let json_str = review_text[pos + 15..].trim();
+                parse_claude_comments(json_str)
+            } else {
+                // Fallback: try to find any JSON array in the output
+                parse_claude_comments_from_text(&review_text)
+            };
+
+            let count = parsed.len();
+            let _ = tx.send(BgMsg::ClaudeReviewOutput(
+                format!("\n\n--- Found {} inline comments ---\n", count),
+            ));
+            let _ = tx.send(BgMsg::ClaudeReviewParsed(parsed));
         });
     }
 
@@ -724,6 +699,14 @@ If no issues found, output an empty array: []"#,
                         self.pending_threads = Some(threads);
                     }
                 }
+                BgMsg::ClaudeReviewOutput(chunk) => {
+                    if let Some(dv) = &mut self.diff_view {
+                        dv.review_output.push_str(&chunk);
+                        // Auto-scroll to bottom — use saturating large value
+                        let line_count = dv.review_output.lines().count() as u16;
+                        dv.review_scroll = line_count;
+                    }
+                }
                 BgMsg::ClaudeReviewParsed(comments) => {
                     if let Some(dv) = &mut self.diff_view {
                         dv.set_claude_comments(comments);
@@ -732,21 +715,23 @@ If no issues found, output an empty array: []"#,
                         self.pending_claude = Some(comments);
                     }
                 }
-                BgMsg::ReviewProgress(chunk) => {
-                    if let Some(popup) = &mut self.review_popup {
-                        if popup.content.starts_with("Running claude") {
-                            popup.content.clear();
+                BgMsg::SubmitResult(result) => {
+                    match result {
+                        Ok(count) => {
+                            // Clear drafts and re-fetch threads so submitted comments appear
+                            if let Some(dv) = &mut self.diff_view {
+                                dv.draft_comments.clear();
+                                dv.submit_status = Some(format!("Submitted {} comment{}", count, if count == 1 { "" } else { "s" }));
+                            }
+                            if let (Some(repo), Some(pr)) = (self.selected_repo_name(), self.selected_pr().cloned()) {
+                                self.fetch_threads(&repo, &pr);
+                            }
                         }
-                        popup.content.push_str(&chunk);
-                    }
-                }
-                BgMsg::ReviewLoaded(result) => {
-                    if let Some(popup) = &mut self.review_popup {
-                        if !result.is_empty() {
-                            popup.content = result;
-                            popup.scroll = 0;
+                        Err(e) => {
+                            if let Some(dv) = &mut self.diff_view {
+                                dv.submit_status = Some(format!("Submit failed: {}", e));
+                            }
                         }
-                        popup.loading = false;
                     }
                 }
                 BgMsg::ApproveResult(result) => {
@@ -774,6 +759,98 @@ If no issues found, output an empty array: []"#,
         self.all_repos.clear();
         self.start_loading();
     }
+}
+
+fn parse_claude_comments(stdout: &str) -> Vec<ClaudeComment> {
+    let extract = |val: &serde_json::Value| -> Vec<ClaudeComment> {
+        val.as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        Some(ClaudeComment {
+                            file: c.get("file")?.as_str()?.to_string(),
+                            line: c.get("line")?.as_u64()?,
+                            body: c.get("body")?.as_str()?.to_string(),
+                            accepted: None,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let trimmed = stdout.trim();
+
+    // Helper: try to extract from any value that might contain comments
+    let try_extract = |val: &serde_json::Value| -> Vec<ClaudeComment> {
+        // Direct array
+        let r = extract(val);
+        if !r.is_empty() { return r; }
+        // {"comments": [...]}
+        if let Some(c) = val.get("comments") {
+            let r = extract(c);
+            if !r.is_empty() { return r; }
+        }
+        Vec::new()
+    };
+
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        // {"result": "..."} — string wrapper from --output-format json
+        if let Some(result_str) = val.get("result").and_then(|r| r.as_str()) {
+            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(result_str) {
+                let r = try_extract(&inner);
+                if !r.is_empty() { return r; }
+            }
+        }
+        // {"result": {...}} or {"result": [...]}
+        if let Some(result_val) = val.get("result") {
+            let r = try_extract(result_val);
+            if !r.is_empty() { return r; }
+        }
+        // Top-level
+        let r = try_extract(&val);
+        if !r.is_empty() { return r; }
+    }
+
+    // Try to find JSON array in the text (maybe mixed with other output)
+    if let Some(start) = trimmed.find('[') {
+        // Find matching closing bracket
+        let mut depth = 0;
+        let mut end = start;
+        for (i, ch) in trimmed[start..].char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end > start {
+            let json_str = &trimmed[start..=end];
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                return extract(&val);
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+/// Try to find and parse a JSON array from freeform text output
+#[allow(dead_code)]
+fn parse_claude_comments_from_text(text: &str) -> Vec<ClaudeComment> {
+    if let Some(start) = text.rfind('[') {
+        if let Some(end) = text[start..].rfind(']') {
+            let json_str = &text[start..start + end + 1];
+            return parse_claude_comments(json_str);
+        }
+    }
+    Vec::new()
 }
 
 pub fn ci_icon(state: &CiState) -> &str {
