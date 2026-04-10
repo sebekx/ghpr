@@ -421,13 +421,18 @@ impl App {
     pub fn show_approve_popup(&mut self) {
         let Some(repo_name) = self.selected_repo_name() else { return };
         let Some(pr) = self.selected_pr() else { return };
+        let result_msg = if pr.draft {
+            Some("✗ Cannot approve a draft PR".to_string())
+        } else {
+            None
+        };
         self.approve_popup = Some(ApprovePopup {
             repo_name,
             pr_number: pr.number,
             pr_title: pr.title.clone(),
             comment: String::new(),
             submitting: false,
-            result_msg: None,
+            result_msg,
         });
     }
 
