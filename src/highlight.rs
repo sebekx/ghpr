@@ -1,4 +1,5 @@
 use ratatui::style::Color;
+use std::collections::HashMap;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -9,10 +10,10 @@ pub struct Highlighter {
     ts: ThemeSet,
 }
 
-/// Pre-highlighted file: each line index maps to colored spans
+/// Pre-highlighted file: maps diff line index -> colored spans (only for code lines)
 #[derive(Debug, Clone)]
 pub struct HighlightedFile {
-    lines: Vec<Vec<(Color, String)>>,
+    lines: HashMap<usize, Vec<(Color, String)>>,
 }
 
 impl Highlighter {
@@ -23,10 +24,10 @@ impl Highlighter {
         }
     }
 
-    /// Highlight all lines of a file at once.
-    /// `path` is used to determine syntax; `code_lines` are the raw code lines (without +/- prefix).
-    pub fn highlight_file(&self, path: &str, code_lines: &[&str]) -> HighlightedFile {
-        // Try file path first, then extension-based lookup
+    /// Highlight code lines of a file.
+    /// `path` determines syntax. `code_lines` is (diff_line_index, stripped_content) pairs
+    /// for only Added/Removed/Context lines.
+    pub fn highlight_file(&self, path: &str, code_lines: &[(usize, &str)]) -> HighlightedFile {
         let syntax = self.ps.find_syntax_for_file(path)
             .ok()
             .flatten()
@@ -46,10 +47,14 @@ impl Highlighter {
         let theme = &self.ts.themes["base16-ocean.dark"];
         let mut h = HighlightLines::new(syntax, theme);
 
-        let full_text: String = code_lines.iter().map(|l| format!("{}\n", l)).collect();
-        let mut result = Vec::with_capacity(code_lines.len());
+        // Build text from only code lines (no meta/hunk garbage)
+        let full_text: String = code_lines.iter().map(|(_, l)| format!("{}\n", l)).collect();
+        let mut result = HashMap::new();
+        let mut idx = 0;
 
         for line in LinesWithEndings::from(&full_text) {
+            if idx >= code_lines.len() { break; }
+            let diff_li = code_lines[idx].0;
             if let Ok(ranges) = h.highlight_line(line, &self.ps) {
                 let spans: Vec<(Color, String)> = ranges
                     .iter()
@@ -59,10 +64,9 @@ impl Highlighter {
                     })
                     .filter(|(_, text)| !text.is_empty())
                     .collect();
-                result.push(spans);
-            } else {
-                result.push(Vec::new());
+                result.insert(diff_li, spans);
             }
+            idx += 1;
         }
 
         HighlightedFile { lines: result }
@@ -71,7 +75,7 @@ impl Highlighter {
 
 impl HighlightedFile {
     pub fn get_spans(&self, line_idx: usize) -> Option<&Vec<(Color, String)>> {
-        self.lines.get(line_idx)
+        self.lines.get(&line_idx)
     }
 }
 

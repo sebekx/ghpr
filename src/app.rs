@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::diff_view::{ClaudeComment, DiffView};
 use crate::github::{CiState, GithubClient, PrStatus, PullRequest, RepoInfo};
 use crate::highlight::Highlighter;
@@ -73,6 +74,10 @@ pub struct App {
     pub file_pane_width: u16,
     pub approve_popup: Option<ApprovePopup>,
     pub highlighter: Highlighter,
+    pub config: Config,
+    /// Search filter mode: if Some, user is typing a filter
+    pub search_mode: bool,
+    pub search_query: String,
 }
 
 pub struct ApprovePopup {
@@ -93,7 +98,7 @@ pub enum DiffFocus {
 
 
 impl App {
-    pub fn new(client: GithubClient) -> Self {
+    pub fn new(client: GithubClient, config: Config) -> Self {
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         Self {
             assigned_repos: Vec::new(),
@@ -127,6 +132,9 @@ impl App {
             file_pane_width: 30,
             approve_popup: None,
             highlighter: Highlighter::new(),
+            config,
+            search_mode: false,
+            search_query: String::new(),
         }
     }
 
@@ -138,6 +146,7 @@ impl App {
             &self.all_repos
         };
 
+        let query = self.search_query.to_lowercase();
         self.flat_prs = repos
             .iter()
             .flat_map(|repo| {
@@ -153,6 +162,17 @@ impl App {
                     pr: pr.clone(),
                 })
             })
+            .filter(|fpr| {
+                if query.is_empty() {
+                    return true;
+                }
+                // Match against PR title, number, repo name, author
+                let num_str = fpr.pr.number.to_string();
+                fpr.pr.title.to_lowercase().contains(&query)
+                    || num_str.contains(&query)
+                    || fpr.repo_short.to_lowercase().contains(&query)
+                    || fpr.pr.user.login.to_lowercase().contains(&query)
+            })
             .collect();
 
         // Sort by updated_at descending
@@ -161,6 +181,12 @@ impl App {
         self.pr_index = self.pr_index.min(self.flat_prs.len().saturating_sub(1));
         self.current_diff = None;
         self.diff_pr_key = None;
+    }
+
+    /// Public method to re-apply filter (used by search)
+    pub fn apply_filter_public(&mut self) {
+        self.apply_filter();
+        self.request_all_statuses();
     }
 
     pub fn toggle_assigned(&mut self) {
@@ -561,7 +587,7 @@ impl App {
     }
 
     /// Open diff view (loads diff, threads, optionally Claude review)
-    pub fn open_diff_view(&mut self, with_claude: bool) {
+    pub fn open_diff_view(&mut self, with_ai: bool) {
         self.diff_view = None;
         self.pending_threads = None;
         self.pending_claude = None;
@@ -578,51 +604,39 @@ impl App {
         self.fetch_threads(&repo_name, &pr);
 
         // Run Claude structured review if requested
-        if with_claude {
-            self.run_structured_claude_review(&repo_name, &pr);
+        if with_ai {
+            self.run_structured_ai_review(&repo_name, &pr);
         }
 
         // DiffView will be created when DiffLoaded arrives
         self.active_tab = Tab::Diff;
     }
 
-    /// Public wrapper to trigger structured Claude review from diff view
-    pub fn run_structured_review_bg(&self, repo_name: &str, pr: &PullRequest) {
-        self.run_structured_claude_review(repo_name, pr);
+    /// Public wrapper to trigger AI review from diff view
+    pub fn run_ai_review_bg(&self, repo_name: &str, pr: &PullRequest) {
+        self.run_structured_ai_review(repo_name, pr);
     }
 
-    fn run_structured_claude_review(&self, repo_name: &str, pr: &PullRequest) {
+    fn run_structured_ai_review(&self, repo_name: &str, pr: &PullRequest) {
         let tx = self.bg_tx.clone();
         let repo = repo_name.to_string();
         let pr_number = pr.number;
+        let config = self.config.clone();
 
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             use tokio::process::Command;
 
             let pr_url = format!("https://github.com/{}/pull/{}", repo, pr_number);
+            let ai_name = &config.ai.name;
             let _ = tx.send(BgMsg::ClaudeReviewOutput(
-                format!("Running /review-pr {}...\n\n", pr_url),
+                format!("Running {} review on {}...\n\n", ai_name, pr_url),
             ));
 
-            let prompt = format!("/review-pr {}", pr_url);
-            let append_prompt = r#"IMPORTANT: After your review, you MUST end your response with a JSON block on a new line starting with ---GHPR_JSON--- followed by a JSON array of all your file-specific comments. Each element must have "file" (full path), "line" (line number in new file), "body" (your comment). Example:
----GHPR_JSON---
-[{"file":"src/app.ts","line":42,"body":"Consider handling the error"}]
-If no comments, output:
----GHPR_JSON---
-[]"#;
+            let expanded_args = config.expand_args(&pr_url);
 
-            let result = Command::new("claude")
-                .args([
-                    "-p", &prompt,
-                    "--append-system-prompt", append_prompt,
-                    "--output-format", "stream-json",
-                    "--verbose",
-                    "--include-partial-messages",
-                    "--no-session-persistence",
-                    "--permission-mode", "bypassPermissions",
-                ])
+            let result = Command::new(&config.ai.command)
+                .args(&expanded_args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
@@ -635,56 +649,67 @@ If no comments, output:
                     if let Some(stdout) = child.stdout.take() {
                         let reader = BufReader::new(stdout);
                         let mut lines = reader.lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                                match val.get("type").and_then(|t| t.as_str()) {
-                                    Some("stream_event") => {
-                                        if let Some(delta) = val
-                                            .pointer("/event/delta/text")
-                                            .and_then(|t| t.as_str())
-                                        {
-                                            review_text.push_str(delta);
-                                            let _ = tx.send(BgMsg::ClaudeReviewOutput(delta.to_string()));
-                                        }
-                                        if let Some(tool) = val
-                                            .pointer("/event/content_block/name")
-                                            .and_then(|t| t.as_str())
-                                        {
-                                            let _ = tx.send(BgMsg::ClaudeReviewOutput(
-                                                format!("\n⚙ {} ", tool),
-                                            ));
-                                        }
-                                        if let Some(input) = val
-                                            .pointer("/event/delta/partial_json")
-                                            .and_then(|t| t.as_str())
-                                        {
-                                            let _ = tx.send(BgMsg::ClaudeReviewOutput(input.to_string()));
-                                        }
-                                    }
-                                    Some("result") => {
-                                        if let Some(r) = val.get("result").and_then(|r| r.as_str()) {
-                                            if !r.is_empty() {
-                                                review_text = r.to_string();
+
+                        if config.ai.output_mode == "stream-json" {
+                            // Claude CLI streaming JSON mode
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                                    match val.get("type").and_then(|t| t.as_str()) {
+                                        Some("stream_event") => {
+                                            if let Some(delta) = val
+                                                .pointer("/event/delta/text")
+                                                .and_then(|t| t.as_str())
+                                            {
+                                                review_text.push_str(delta);
+                                                let _ = tx.send(BgMsg::ClaudeReviewOutput(delta.to_string()));
+                                            }
+                                            if let Some(tool) = val
+                                                .pointer("/event/content_block/name")
+                                                .and_then(|t| t.as_str())
+                                            {
+                                                let _ = tx.send(BgMsg::ClaudeReviewOutput(
+                                                    format!("\n-> {} ", tool),
+                                                ));
+                                            }
+                                            if let Some(input) = val
+                                                .pointer("/event/delta/partial_json")
+                                                .and_then(|t| t.as_str())
+                                            {
+                                                let _ = tx.send(BgMsg::ClaudeReviewOutput(input.to_string()));
                                             }
                                         }
-                                    }
-                                    Some("assistant") => {
-                                        if let Some(content) = val.pointer("/message/content") {
-                                            if let Some(arr) = content.as_array() {
-                                                for block in arr {
-                                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                                            if !text.is_empty() {
-                                                                review_text = text.to_string();
+                                        Some("result") => {
+                                            if let Some(r) = val.get("result").and_then(|r| r.as_str()) {
+                                                if !r.is_empty() {
+                                                    review_text = r.to_string();
+                                                }
+                                            }
+                                        }
+                                        Some("assistant") => {
+                                            if let Some(content) = val.pointer("/message/content") {
+                                                if let Some(arr) = content.as_array() {
+                                                    for block in arr {
+                                                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                                                if !text.is_empty() {
+                                                                    review_text = text.to_string();
+                                                                }
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
+                                        _ => {}
                                     }
-                                    _ => {}
                                 }
+                            }
+                        } else {
+                            // Text mode: collect all stdout
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                review_text.push_str(&line);
+                                review_text.push('\n');
+                                let _ = tx.send(BgMsg::ClaudeReviewOutput(format!("{}\n", line)));
                             }
                         }
                     }
@@ -697,12 +722,12 @@ If no comments, output:
                 }
             }
 
-            // Parse JSON from the review output (after ---GHPR_JSON--- marker)
-            let parsed = if let Some(pos) = review_text.find("---GHPR_JSON---") {
-                let json_str = review_text[pos + 15..].trim();
+            // Parse JSON from the review output (after marker)
+            let marker = &config.ai.json_marker;
+            let parsed = if let Some(pos) = review_text.find(marker) {
+                let json_str = review_text[pos + marker.len()..].trim();
                 parse_claude_comments(json_str)
             } else {
-                // Fallback: try to find any JSON array in the output
                 parse_claude_comments_from_text(&review_text)
             };
 
@@ -814,7 +839,20 @@ If no comments, output:
                     if let Some(popup) = &mut self.approve_popup {
                         popup.submitting = false;
                         match result {
-                            Ok(()) => popup.result_msg = Some("✓ PR approved!".to_string()),
+                            Ok(()) => {
+                                popup.result_msg = Some("✓ PR approved!".to_string());
+                                // Re-fetch status so the PR list updates
+                                let repo = popup.repo_name.clone();
+                                let pr_number = popup.pr_number;
+                                self.status_requested.remove(&repo);
+                                if let Some(key) = self.pr_statuses.keys()
+                                    .find(|(r, n)| r == &repo && *n == pr_number)
+                                    .cloned()
+                                {
+                                    self.pr_statuses.remove(&key);
+                                }
+                                self.request_all_statuses();
+                            }
                             Err(e) => popup.result_msg = Some(format!("✗ Failed: {}", e)),
                         }
                     }
@@ -843,10 +881,16 @@ fn parse_claude_comments(stdout: &str) -> Vec<ClaudeComment> {
             .map(|arr| {
                 arr.iter()
                     .filter_map(|c| {
+                        // Support both "file"/"filename" and "body"/"comment"
+                        let file = c.get("filename").or_else(|| c.get("file"))?.as_str()?.to_string();
+                        let line = c.get("line")?.as_u64()?;
+                        let body = c.get("comment").or_else(|| c.get("body"))?.as_str()?.to_string();
+                        let severity = c.get("severity").and_then(|s| s.as_str()).map(|s| s.to_string());
                         Some(ClaudeComment {
-                            file: c.get("file")?.as_str()?.to_string(),
-                            line: c.get("line")?.as_u64()?,
-                            body: c.get("body")?.as_str()?.to_string(),
+                            file,
+                            line,
+                            body,
+                            severity,
                             accepted: None,
                         })
                     })

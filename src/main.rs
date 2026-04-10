@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod diff_view;
 mod github;
 mod highlight;
@@ -43,8 +44,19 @@ async fn main() -> Result<()> {
             "No GitHub token found. Set GITHUB_TOKEN, GH_TOKEN, or install gh CLI and run `gh auth login`.",
         )?;
 
+    // Load or create config
+    let cfg = match config::Config::load()? {
+        Some(c) => c,
+        None => {
+            let path = config::Config::write_default()?;
+            eprintln!("Created default config at: {}", path.display());
+            eprintln!("Edit it to configure your AI review agent.\n");
+            config::Config::default()
+        }
+    };
+
     let client = GithubClient::new(token)?;
-    let mut app = App::new(client);
+    let mut app = App::new(client, cfg);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -243,18 +255,24 @@ fn run_app(
                                 app.tree_index = ti;
                             }
                         }
-                        KeyCode::Char('a') => dv.start_new_comment(),
+                        KeyCode::Char('a') => {
+                            // Accept AI comment if near one, otherwise start new comment
+                            if dv.has_pending_ai_at_cursor() {
+                                dv.accept_claude_at_cursor();
+                            } else {
+                                dv.start_new_comment();
+                            }
+                        }
                         KeyCode::Char('r') => dv.start_reply(),
-                        KeyCode::Char('y') => dv.accept_claude_at_cursor(),
-                        KeyCode::Char('x') => dv.discard_claude_at_cursor(),
+                        KeyCode::Char('d') => dv.discard_claude_at_cursor(),
                         KeyCode::Char('e') => dv.edit_claude_at_cursor(),
                         KeyCode::Char('c') => {
-                            // Run structured Claude review into diff view
+                            // Run AI review into diff view
                             if let (Some(repo), Some(pr)) = (app.selected_repo_name(), app.selected_pr().cloned()) {
                                 if let Some(dv) = &mut app.diff_view {
                                     dv.loading_review = true;
                                 }
-                                app.run_structured_review_bg(&repo, &pr);
+                                app.run_ai_review_bg(&repo, &pr);
                             }
                         }
                         KeyCode::Char('S') => {
@@ -269,9 +287,40 @@ fn run_app(
                     continue;
                 }
 
+                // --- Search mode (PR filter) ---
+                if app.search_mode {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.search_mode = false;
+                            app.search_query.clear();
+                            app.apply_filter_public();
+                        }
+                        KeyCode::Enter => {
+                            app.search_mode = false;
+                            // Keep the filter active
+                        }
+                        KeyCode::Backspace => {
+                            app.search_query.pop();
+                            app.apply_filter_public();
+                        }
+                        KeyCode::Char(c) => {
+                            app.search_query.push(c);
+                            app.apply_filter_public();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // --- Normal mode (PR list) ---
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Esc => {
+                        if !app.search_query.is_empty() {
+                            app.search_query.clear();
+                            app.apply_filter_public();
+                        }
+                    }
                     KeyCode::Char('?') => { app.show_help = true; }
                     KeyCode::Up | KeyCode::Char('k') => app.move_up(),
                     KeyCode::Down | KeyCode::Char('j') => app.move_down(),
@@ -281,6 +330,7 @@ fn run_app(
                     }
                     KeyCode::Char('A') => app.show_approve_popup(),
                     KeyCode::Char('a') => app.toggle_assigned(),
+                    KeyCode::Char('/') => { app.search_mode = true; }
                     KeyCode::Char('r') => app.refresh(),
                     KeyCode::Char('o') => {
                         if let Some(pr) = app.selected_pr() {

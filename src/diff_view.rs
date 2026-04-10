@@ -77,6 +77,7 @@ pub struct ClaudeComment {
     pub file: String,
     pub line: u64,
     pub body: String,
+    pub severity: Option<String>,
     pub accepted: Option<bool>,
 }
 
@@ -150,19 +151,22 @@ impl DiffView {
             return;
         }
         let Some(file) = self.files.get(idx) else { return };
-        // Collect code lines stripping +/- prefix
-        let code_lines: Vec<&str> = file.lines.iter().map(|dl| {
-            let c = dl.content.as_str();
-            match dl.kind {
-                LineKind::Added | LineKind::Removed => {
-                    if c.is_empty() { c } else { &c[1..] }
+        // Only pass code lines (Added/Removed/Context) to the highlighter,
+        // skipping Meta/Hunk which would corrupt the parser state.
+        let code_lines: Vec<(usize, &str)> = file.lines.iter().enumerate()
+            .filter_map(|(li, dl)| {
+                let c = dl.content.as_str();
+                match dl.kind {
+                    LineKind::Added | LineKind::Removed => {
+                        Some((li, if c.is_empty() { c } else { &c[1..] }))
+                    }
+                    LineKind::Context => {
+                        Some((li, if c.starts_with(' ') { &c[1..] } else { c }))
+                    }
+                    _ => None,
                 }
-                LineKind::Context => {
-                    if c.starts_with(' ') { &c[1..] } else { c }
-                }
-                _ => c,
-            }
-        }).collect();
+            })
+            .collect();
         let highlighted = highlighter.highlight_file(&file.path, &code_lines);
         self.highlight_cache.insert(idx, highlighted);
     }
@@ -588,6 +592,11 @@ impl DiffView {
     pub fn cancel_input(&mut self) {
         self.input_mode = None;
         self.input_buffer.clear();
+    }
+
+    /// Check if there's a pending AI comment near the cursor
+    pub fn has_pending_ai_at_cursor(&self) -> bool {
+        !self.find_nearest_claude().is_empty()
     }
 
     /// Find nearest Claude comment index within ±3 lines of cursor

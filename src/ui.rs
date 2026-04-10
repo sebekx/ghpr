@@ -33,6 +33,16 @@ fn padded_line(spans: Vec<Span<'_>>, width: usize, bg: Color) -> Line<'_> {
 }
 
 /// Word-wrap text: first output line at `first_width`, continuation lines at `rest_width`
+/// Find the byte index of the char boundary at or before byte position `pos`
+fn floor_char_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() { return s.len(); }
+    let mut i = pos;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 fn wrap_text_2(text: &str, first_width: usize, rest_width: usize) -> Vec<String> {
     let mut wrapped = Vec::new();
     let fw = first_width.max(10);
@@ -45,13 +55,14 @@ fn wrap_text_2(text: &str, first_width: usize, rest_width: usize) -> Vec<String>
             let mut remaining = line;
             let mut cur_w = w;
             while remaining.len() > cur_w {
-                let break_at = remaining[..cur_w]
+                let safe_end = floor_char_boundary(remaining, cur_w);
+                let break_at = remaining[..safe_end]
                     .rfind(' ')
-                    .unwrap_or(cur_w);
-                let break_at = break_at.max(1); // never produce empty chunk
+                    .unwrap_or(safe_end);
+                let break_at = break_at.max(1);
                 wrapped.push(remaining[..break_at].to_string());
                 remaining = remaining[break_at..].trim_start();
-                cur_w = rw; // after first chunk, use rest_width
+                cur_w = rw;
             }
             if !remaining.is_empty() {
                 wrapped.push(remaining.to_string());
@@ -168,7 +179,8 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(""),
         s("PR Icons"),
-        h("\u{f407}", Color::Green, "Open pull request"),
+        h("\u{f407}", Color::Green, "Open PR / ready to merge"),
+        h("\u{f407}", Color::Red, "PR has conflicts / blocked"),
         h("\u{f444}", Color::DarkGray, "Draft pull request"),
         Line::from(""),
         s("CI Status"),
@@ -184,15 +196,14 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         h("\u{f4a1}", Color::Cyan, "Pending review"),
         Line::from(""),
         s("Attention"),
-        h("\u{f06a}", Color::Red, "Changes requested / conflict"),
+        h("\u{f06a}", Color::Red, "Changes requested"),
         h("\u{f075}", Color::Yellow, "Has review comments"),
-        h("\u{f407}", Color::Green, "Ready to merge"),
         Line::from(""),
         s("Keys"),
         h("↑↓/jk", Color::DarkGray, "Navigate / scroll"),
         h("Tab", Color::DarkGray, "Switch panel"),
         h("a", Color::DarkGray, "Toggle assigned / all"),
-        h("c", Color::DarkGray, "Claude review"),
+        h("c", Color::DarkGray, "AI review"),
         h("r", Color::DarkGray, "Refresh"),
         h("o", Color::DarkGray, "Open in browser"),
         h("Enter", Color::DarkGray, "Load diff"),
@@ -271,6 +282,10 @@ fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
             let pr_icon = if pr.draft { NERD_DRAFT } else { NERD_PR };
             let pr_icon_color = if pr.draft {
                 Color::DarkGray
+            } else if pr.mergeable == Some(false)
+                || matches!(pr.mergeable_state.as_deref(), Some("dirty") | Some("blocked"))
+            {
+                Color::Red
             } else {
                 Color::Green
             };
@@ -327,29 +342,7 @@ fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
 
-            // Merge status indicators
-            match pr.mergeable_state.as_deref() {
-                Some("dirty") | Some("blocked") => {
-                    // Conflict or blocked
-                    indicators.push(Span::styled(
-                        "\u{f06a} ", // exclamation circle
-                        Style::default().fg(Color::Red),
-                    ));
-                }
-                _ => {
-                    if pr.mergeable == Some(false) {
-                        indicators.push(Span::styled(
-                            "\u{f06a} ",
-                            Style::default().fg(Color::Red),
-                        ));
-                    } else if pr.mergeable_state.as_deref() == Some("clean") && pr.mergeable == Some(true) {
-                        indicators.push(Span::styled(
-                            "\u{f00c} ", // check — ready to merge
-                            Style::default().fg(Color::Rgb(0, 200, 100)),
-                        ));
-                    }
-                }
-            }
+            // Merge status indicators are now reflected in PR icon color
 
             let mut spans = vec![
                 Span::styled(prefix, style),
@@ -397,11 +390,11 @@ fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(
-                " {} Pull Requests ({}) ",
-                NERD_PR,
-                app.flat_prs.len()
-            ))
+            .title(if app.search_query.is_empty() {
+                format!(" {} Pull Requests ({}) ", NERD_PR, app.flat_prs.len())
+            } else {
+                format!(" {} Pull Requests ({}) /{} ", NERD_PR, app.flat_prs.len(), app.search_query)
+            })
             .border_style(panel_border_style(app, Panel::PullRequests)),
     );
     let mut state = ListState::default().with_selected(Some(app.pr_index));
@@ -706,15 +699,34 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "all…"
     };
-    let nav_help = format!(
-        " ↑↓ navigate │ Tab panel │ a [{filter_label}] │ Enter diff │ A approve │ r refresh │ o open │ ? help │ q quit "
-    );
-
-    let help = Paragraph::new(Span::styled(
-        &nav_help,
-        Style::default().fg(Color::DarkGray),
-    ));
-    f.render_widget(help, chunks[0]);
+    if app.search_mode {
+        let search_line = Line::from(vec![
+            Span::styled(" /", Style::default().fg(Color::Yellow)),
+            Span::styled(&app.search_query, Style::default().fg(Color::White)),
+            Span::styled("▎", Style::default().fg(Color::Yellow)),
+            Span::styled("  Enter confirm │ Esc clear", Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(search_line), chunks[0]);
+    } else if !app.search_query.is_empty() {
+        let filter_line = Line::from(vec![
+            Span::styled(" /", Style::default().fg(Color::Rgb(255, 160, 50))),
+            Span::styled(&app.search_query, Style::default().fg(Color::Rgb(255, 160, 50))),
+            Span::styled(
+                format!(" │ ↑↓ navigate │ Tab panel │ a [{filter_label}] │ Enter diff │ A approve │ Esc clear filter "),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(filter_line), chunks[0]);
+    } else {
+        let nav_help = format!(
+            " ↑↓ navigate │ Tab panel │ a [{filter_label}] │ / filter │ Enter diff │ A approve │ r refresh │ o open │ ? help │ q quit "
+        );
+        let help = Paragraph::new(Span::styled(
+            &nav_help,
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(help, chunks[0]);
+    }
 
     let user_info = Paragraph::new(Span::styled(
         format!(" {} {} ", NERD_USER, app.username),
@@ -835,9 +847,9 @@ fn draw_diff_view(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
         f.render_widget(Clear, popup_area);
 
         let title = if dv.loading_review {
-            format!(" {} Claude Review ", NERD_REFRESH)
+            format!(" {} {} Review [{}] ", NERD_REFRESH, app.config.ai.name, app.config.ai.command)
         } else {
-            " Claude Review (done) ".to_string()
+            format!(" {} Review [{}] (done) ", app.config.ai.name, app.config.ai.command)
         };
         let bottom = if dv.loading_review {
             " ↑↓ scroll │ Esc hide "
@@ -1021,10 +1033,23 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
         lines.push(Line::from(""));
     }
 
-    // File-level Claude comments (line not in diff)
+    let ai_label = format!("\u{f12a} {}", app.config.ai.name);
+    let severity_color = |s: &str| -> Color {
+        match s.to_uppercase().as_str() {
+            "CRITICAL" => Color::Red,
+            "HIGH" => Color::Rgb(255, 100, 50),
+            "MEDIUM" => Color::Yellow,
+            "LOW" => Color::Rgb(100, 180, 100),
+            "INFO" => Color::Cyan,
+            _ => Color::DarkGray,
+        }
+    };
+
+    // File-level AI comments (line not in diff)
     if scroll == 0 && !dv.file_level_claude.is_empty() {
+        let ai_file_label = format!("  \u{f12a} {} comments (file-level)", app.config.ai.name);
         lines.push(Line::from(Span::styled(
-            "  \u{f12a} Claude comments (file-level)",
+            ai_file_label,
             Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         )));
         let comment_bg = Color::Rgb(20, 15, 30);
@@ -1032,7 +1057,7 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
         for &ci in &dv.file_level_claude {
             if let Some(cc) = dv.claude_comments.get(ci) {
                 let (label, frame_style) = match cc.accepted {
-                    None => ("\u{f12a} Claude", Style::default().fg(Color::Magenta)),
+                    None => (ai_label.as_str(), Style::default().fg(Color::Magenta)),
                     Some(true) => ("\u{f00c} Accepted", Style::default().fg(Color::Green)),
                     Some(false) => ("\u{f00d} Discarded", Style::default().fg(Color::DarkGray)),
                 };
@@ -1041,10 +1066,14 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                     _ => Style::default().fg(Color::Rgb(180, 180, 200)),
                 };
                 let line_hint = if cc.line > 0 { format!(" (line {})", cc.line) } else { String::new() };
-                lines.push(padded_line(vec![
+                let mut header_spans = vec![
                     Span::raw("  "),
                     Span::styled(format!("┌─ {}{} ", label, line_hint), frame_style),
-                ], inner_width, comment_bg));
+                ];
+                if let Some(sev) = &cc.severity {
+                    header_spans.push(Span::styled(format!("— {} ", sev), Style::default().fg(severity_color(sev))));
+                }
+                lines.push(padded_line(header_spans, inner_width, comment_bg));
                 let wrapped = wrap_text_2(&cc.body, cl_wrap_w, cl_wrap_w);
                 for wl in &wrapped {
                     lines.push(padded_line(vec![
@@ -1264,7 +1293,7 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
             for &ci in claude_indices {
                 if let Some(cc) = dv.claude_comments.get(ci) {
                     let (label, frame_style) = match cc.accepted {
-                        None => ("\u{f12a} Claude", Style::default().fg(Color::Magenta)),
+                        None => (ai_label.as_str(), Style::default().fg(Color::Magenta)),
                         Some(true) => ("\u{f00c} Accepted", Style::default().fg(Color::Green)),
                         Some(false) => ("\u{f00d} Discarded", Style::default().fg(Color::DarkGray)),
                     };
@@ -1273,10 +1302,14 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                         _ => Style::default().fg(Color::Rgb(180, 180, 200)),
                     };
                     let comment_bg = Color::Rgb(20, 15, 30);
-                    lines.push(padded_line(vec![
+                    let mut header_spans = vec![
                         Span::raw("          "),
                         Span::styled(format!("┌─ {} ", label), frame_style),
-                    ], inner_width, comment_bg));
+                    ];
+                    if let Some(sev) = &cc.severity {
+                        header_spans.push(Span::styled(format!("— {} ", sev), Style::default().fg(severity_color(sev))));
+                    }
+                    lines.push(padded_line(header_spans, inner_width, comment_bg));
                     let wrapped = wrap_text_2(&cc.body, cl_wrap, cl_wrap);
                     for wl in &wrapped {
                         lines.push(padded_line(vec![
@@ -1290,11 +1323,11 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                             lines.push(padded_line(vec![
                                 Span::raw("          "),
                                 Span::styled("└─", frame_style),
-                                Span::styled(" y ", Style::default().fg(Color::Yellow)),
+                                Span::styled(" a ", Style::default().fg(Color::Yellow)),
                                 Span::styled("accept │ ", Style::default().fg(Color::DarkGray)),
                                 Span::styled("e ", Style::default().fg(Color::Yellow)),
                                 Span::styled("edit │ ", Style::default().fg(Color::DarkGray)),
-                                Span::styled("x ", Style::default().fg(Color::Yellow)),
+                                Span::styled("d ", Style::default().fg(Color::Yellow)),
                                 Span::styled("discard", Style::default().fg(Color::DarkGray)),
                             ], inner_width, comment_bg));
                         }
@@ -1309,12 +1342,16 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
             }
         }
 
-        // Draft new comments (not replies)
+        // Draft new comments (not replies, skip accepted AI comments already shown)
         for draft in &dv.draft_comments {
             if draft.in_reply_to_thread.is_none() && draft.file == file.path {
                 let matches = dl.new_line == Some(draft.line)
                     || dl.old_line == Some(draft.line);
-                if matches {
+                // Skip if this draft came from an accepted AI comment (already rendered above)
+                let from_accepted_ai = dv.claude_comments.iter().any(|cc| {
+                    cc.accepted == Some(true) && cc.file == draft.file && cc.line == draft.line && cc.body == draft.body
+                });
+                if matches && !from_accepted_ai {
                     let draft_bg = Color::Rgb(15, 25, 15);
                     let dw = inner_width.saturating_sub(14);
                     lines.push(padded_line(vec![
@@ -1375,7 +1412,7 @@ fn draw_input_overlay(f: &mut Frame, dv: &DiffView, diff_area: Rect) {
     let (title, is_reply, resolve) = match &dv.input_mode {
         Some(crate::diff_view::InputMode::NewComment { .. }) => (" New Comment ", false, false),
         Some(crate::diff_view::InputMode::Reply { resolve, .. }) => (" Reply ", true, *resolve),
-        Some(crate::diff_view::InputMode::EditClaude { .. }) => (" Edit Claude Comment ", false, false),
+        Some(crate::diff_view::InputMode::EditClaude { .. }) => (" Edit AI Comment ", false, false),
         None => (" Comment ", false, false),
     };
 
@@ -1419,9 +1456,9 @@ fn draw_input_overlay(f: &mut Frame, dv: &DiffView, diff_area: Rect) {
 }
 
 fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, area: Rect) {
-    let loading = if dv.loading_review { " \u{f450} Claude reviewing… │" } else { "" };
+    let loading = if dv.loading_review { " \u{f450} AI reviewing… │" } else { "" };
     let threads = dv.threads.iter().filter(|t| !t.is_resolved).count();
-    let claude_pending = dv.claude_comments.iter().filter(|c| c.accepted.is_none()).count();
+    let ai_pending = dv.claude_comments.iter().filter(|c| c.accepted.is_none()).count();
     let drafts = dv.draft_comments.len();
 
     if let Some(status) = &dv.submit_status {
@@ -1439,8 +1476,8 @@ fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, area: Rect) {
     let submit_hint = if has_pending { " │ S submit" } else { "" };
     let resolve_count = if resolves > 0 { format!(" resolve:{}", resolves) } else { String::new() };
     let info = format!(
-        " ↑↓ scroll │ n/N comments │ a add │ r reply │ R resolve │ c claude │ y/e/x accept/edit/discard{} │ q back {}│ threads:{} claude:{} drafts:{}{}",
-        submit_hint, loading, threads, claude_pending, drafts, resolve_count
+        " ↑↓ scroll │ n/N comments │ a add/accept │ r reply │ R resolve │ c ai │ e edit │ d discard{} │ q back {}│ threads:{} ai:{} drafts:{}{}",
+        submit_hint, loading, threads, ai_pending, drafts, resolve_count
     );
 
     let bar = Paragraph::new(Span::styled(info, Style::default().fg(Color::DarkGray)));
