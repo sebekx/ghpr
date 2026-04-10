@@ -101,9 +101,50 @@ fn run_app(
 
                 // --- Modal layers (highest priority first) ---
 
+                // Confirm quit popup
+                if app.confirm_quit.is_some() {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            let action = app.confirm_quit.take().unwrap();
+                            match action {
+                                app::ConfirmQuit::App => return Ok(()),
+                                app::ConfirmQuit::CloseDiff => {
+                                    app.diff_view = None;
+                                    app.active_tab = app::Tab::Overview;
+                                }
+                            }
+                        }
+                        _ => { app.confirm_quit = None; }
+                    }
+                    continue;
+                }
+
                 // Help popup
                 if app.show_help {
                     app.show_help = false;
+                    continue;
+                }
+
+                // Comment popup
+                if app.comment_popup.is_some() {
+                    let has_result = app.comment_popup.as_ref().map_or(false, |p| p.result_msg.is_some());
+                    if has_result {
+                        app.comment_popup = None;
+                    } else {
+                        match key.code {
+                            KeyCode::Enter => app.submit_comment(),
+                            KeyCode::Esc | KeyCode::Char('q') => { app.comment_popup = None; }
+                            KeyCode::Backspace => {
+                                if let Some(p) = &mut app.comment_popup { p.body.pop(); }
+                            }
+                            KeyCode::Char(c) => {
+                                if let Some(p) = &mut app.comment_popup {
+                                    if !p.submitting { p.body.push(c); }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     continue;
                 }
 
@@ -180,8 +221,12 @@ fn run_app(
                     let focus = app.diff_focus;
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => {
-                            app.diff_view = None;
-                            app.active_tab = app::Tab::Overview;
+                            if app.has_pending_drafts() {
+                                app.confirm_quit = Some(app::ConfirmQuit::CloseDiff);
+                            } else {
+                                app.diff_view = None;
+                                app.active_tab = app::Tab::Overview;
+                            }
                         }
                         KeyCode::Tab => {
                             app.diff_focus = match app.diff_focus {
@@ -314,7 +359,13 @@ fn run_app(
 
                 // --- Normal mode (PR list) ---
                 match key.code {
-                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('q') => {
+                        if app.has_pending_drafts() {
+                            app.confirm_quit = Some(app::ConfirmQuit::App);
+                        } else {
+                            return Ok(());
+                        }
+                    }
                     KeyCode::Esc => {
                         if !app.search_query.is_empty() {
                             app.search_query.clear();
@@ -329,7 +380,12 @@ fn run_app(
                         app.open_diff_view(false);
                     }
                     KeyCode::Char('A') => app.show_approve_popup(),
-                    KeyCode::Char('a') => app.toggle_assigned(),
+                    KeyCode::Char('a') => {
+                        match app.active_panel {
+                            app::Panel::Details => app.show_comment_popup(),
+                            app::Panel::PullRequests => app.toggle_assigned(),
+                        }
+                    }
                     KeyCode::Char('/') => { app.search_mode = true; }
                     KeyCode::Char('r') => app.refresh(),
                     KeyCode::Char('o') => {

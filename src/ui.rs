@@ -9,8 +9,13 @@ use ratatui::{
     Frame,
 };
 
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn spinner(frame: usize) -> char {
+    SPINNER_FRAMES[(frame / 2) % SPINNER_FRAMES.len()]
+}
+
 const NERD_PR: &str = "\u{f407}";
-const NERD_DRAFT: &str = "\u{f444}";
 const NERD_USER: &str = "\u{f007}";
 const NERD_BRANCH: &str = "\u{e725}";
 const NERD_PLUS: &str = "\u{f457}";
@@ -76,6 +81,7 @@ fn wrap_text_2(text: &str, first_width: usize, rest_width: usize) -> Vec<String>
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    app.frame = app.frame.wrapping_add(1);
     let size = f.area();
 
     // Ensure syntax highlighting and scroll are correct for current file
@@ -125,7 +131,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             .constraints([Constraint::Min(0), Constraint::Length(1)])
             .split(size);
         draw_diff_view(f, app, dv, chunks[0]);
-        draw_diff_view_status_bar(f, dv, chunks[1]);
+        draw_diff_view_status_bar(f, dv, app.frame, chunks[1]);
     } else {
         // PR list view
         let chunks = Layout::default()
@@ -140,6 +146,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_approve_popup(f, popup, size);
     }
 
+    if let Some(popup) = &app.comment_popup {
+        draw_comment_popup(f, popup, size);
+    }
+
+    if app.confirm_quit.is_some() {
+        draw_confirm_quit_popup(f, app, size);
+    }
+
     if app.show_help {
         draw_help_popup(f, size);
     }
@@ -148,7 +162,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_help_popup(f: &mut Frame, area: Rect) {
     let w = 52u16.min(area.width.saturating_sub(4));
-    let h = 28u16.min(area.height.saturating_sub(4));
+    let h = 34u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup_area = Rect::new(x, y, w, h);
@@ -181,7 +195,7 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         s("PR Icons"),
         h("\u{f407}", Color::Green, "Open PR / ready to merge"),
         h("\u{f407}", Color::Red, "PR has conflicts / blocked"),
-        h("\u{f444}", Color::DarkGray, "Draft pull request"),
+        h("\u{f407}", Color::Rgb(255, 165, 0), "Draft pull request"),
         Line::from(""),
         s("CI Status"),
         h("\u{f00c}", Color::Green, "CI passing"),
@@ -199,14 +213,22 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         h("\u{f06a}", Color::Red, "Changes requested"),
         h("\u{f075}", Color::Yellow, "Has review comments"),
         Line::from(""),
-        s("Keys"),
-        h("↑↓/jk", Color::DarkGray, "Navigate / scroll"),
-        h("Tab", Color::DarkGray, "Switch panel"),
+        s("Keys (PR list)"),
+        h("↑↓/jk", Color::DarkGray, "Navigate"),
         h("a", Color::DarkGray, "Toggle assigned / all"),
-        h("c", Color::DarkGray, "AI review"),
+        h("/", Color::DarkGray, "Filter"),
+        Line::from(""),
+        s("Keys (Details)"),
+        h("↑↓/jk", Color::DarkGray, "Scroll"),
+        h("a", Color::DarkGray, "Comment on PR"),
+        Line::from(""),
+        s("Keys (Global)"),
+        h("Tab", Color::DarkGray, "Switch panel"),
+        h("A", Color::DarkGray, "Approve PR"),
+        h("Enter", Color::DarkGray, "Load diff"),
         h("r", Color::DarkGray, "Refresh"),
         h("o", Color::DarkGray, "Open in browser"),
-        h("Enter", Color::DarkGray, "Load diff"),
+        h("?", Color::DarkGray, "Help"),
         h("q", Color::DarkGray, "Quit"),
     ];
 
@@ -238,11 +260,11 @@ fn panel_border_style(app: &App, panel: Panel) -> Style {
 
 fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
     if app.loading {
-        let loading = Paragraph::new(format!(" {} Loading pull requests...", NERD_REFRESH))
+        let loading = Paragraph::new(format!(" Loading pull requests... {}", spinner(app.frame)))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!(" {} Pull Requests ", NERD_PR))
+                    .title(format!(" {} Pull Requests {} ", NERD_PR, spinner(app.frame)))
                     .border_style(panel_border_style(app, Panel::PullRequests)),
             )
             .style(Style::default().fg(Color::Yellow));
@@ -264,11 +286,21 @@ fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .flat_prs
-        .iter()
-        .enumerate()
-        .map(|(i, fpr)| {
+    let mut items: Vec<ListItem> = Vec::new();
+
+    for (i, fpr) in app.flat_prs.iter().enumerate() {
+            // Insert separator before the approved section
+            if let Some(sep_idx) = app.approved_separator {
+                if i == sep_idx {
+                    let sep_line = Line::from(vec![
+                        Span::styled("  ── ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Approved by me", Style::default().fg(Color::DarkGray)),
+                        Span::styled(" ──────────────────────────────────────", Style::default().fg(Color::DarkGray)),
+                    ]);
+                    items.push(ListItem::new(vec![sep_line]));
+                }
+            }
+
             let pr = &fpr.pr;
             let style = if i == app.pr_index {
                 Style::default()
@@ -279,9 +311,9 @@ fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
             };
             let prefix = if i == app.pr_index { "▸ " } else { "  " };
 
-            let pr_icon = if pr.draft { NERD_DRAFT } else { NERD_PR };
+            let pr_icon = NERD_PR;
             let pr_icon_color = if pr.draft {
-                Color::DarkGray
+                Color::Rgb(255, 165, 0) // orange for draft
             } else if pr.mergeable == Some(false)
                 || matches!(pr.mergeable_state.as_deref(), Some("dirty") | Some("blocked"))
             {
@@ -379,25 +411,39 @@ fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
             ]);
 
             let item = ListItem::new(vec![line1, line2]);
-            if i == app.pr_index {
+            items.push(if i == app.pr_index {
                 item.style(Style::default().bg(Color::Rgb(25, 25, 40)))
             } else {
                 item
-            }
-        })
-        .collect();
+            });
+    }
 
+    let selected = if let Some(sep_idx) = app.approved_separator {
+        if app.pr_index >= sep_idx {
+            app.pr_index + 1 // account for separator item
+        } else {
+            app.pr_index
+        }
+    } else {
+        app.pr_index
+    };
+    let spin = if app.is_fetching() {
+        format!(" {}", spinner(app.frame))
+    } else {
+        String::new()
+    };
+    let title = if app.search_query.is_empty() {
+        format!(" {} Pull Requests ({}){} ", NERD_PR, app.flat_prs.len(), spin)
+    } else {
+        format!(" {} Pull Requests ({}) /{}{} ", NERD_PR, app.flat_prs.len(), app.search_query, spin)
+    };
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(if app.search_query.is_empty() {
-                format!(" {} Pull Requests ({}) ", NERD_PR, app.flat_prs.len())
-            } else {
-                format!(" {} Pull Requests ({}) /{} ", NERD_PR, app.flat_prs.len(), app.search_query)
-            })
+            .title(title)
             .border_style(panel_border_style(app, Panel::PullRequests)),
     );
-    let mut state = ListState::default().with_selected(Some(app.pr_index));
+    let mut state = ListState::default().with_selected(Some(selected));
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -417,19 +463,20 @@ fn draw_details_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let pr = &fpr.pr;
     let repo_name = &fpr.repo_name;
-    let pr_icon = if pr.draft { NERD_DRAFT } else { NERD_PR };
+    let pr_icon = NERD_PR;
+    let pr_icon_color = if pr.draft { Color::Rgb(255, 165, 0) } else { Color::Green };
 
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
                 format!("{} #{} ", pr_icon, pr.number),
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(pr_icon_color)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 if pr.draft { "[DRAFT]" } else { "" },
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Rgb(255, 165, 0)),
             ),
         ]),
         Line::from(Span::styled(
@@ -699,6 +746,15 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "all…"
     };
+    let panel_keys = match app.active_panel {
+        Panel::PullRequests => format!(
+            "↑↓ navigate │ Tab panel │ a [{filter_label}] │ / filter │ Enter diff │ A approve │ r refresh │ o open │ ? help │ q quit"
+        ),
+        Panel::Details => format!(
+            "↑↓ scroll │ Tab panel │ a comment │ A approve │ Enter diff │ r refresh │ o open │ ? help │ q quit"
+        ),
+    };
+
     if app.search_mode {
         let search_line = Line::from(vec![
             Span::styled(" /", Style::default().fg(Color::Yellow)),
@@ -712,17 +768,14 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(" /", Style::default().fg(Color::Rgb(255, 160, 50))),
             Span::styled(&app.search_query, Style::default().fg(Color::Rgb(255, 160, 50))),
             Span::styled(
-                format!(" │ ↑↓ navigate │ Tab panel │ a [{filter_label}] │ Enter diff │ A approve │ Esc clear filter "),
+                format!(" │ {} │ Esc clear filter", panel_keys),
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
         f.render_widget(Paragraph::new(filter_line), chunks[0]);
     } else {
-        let nav_help = format!(
-            " ↑↓ navigate │ Tab panel │ a [{filter_label}] │ / filter │ Enter diff │ A approve │ r refresh │ o open │ ? help │ q quit "
-        );
         let help = Paragraph::new(Span::styled(
-            &nav_help,
+            format!(" {}", panel_keys),
             Style::default().fg(Color::DarkGray),
         ));
         f.render_widget(help, chunks[0]);
@@ -736,8 +789,55 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(user_info, chunks[1]);
 }
 
-// ── Confirm popup ──────────────────────────────────────────
+// ── Confirm quit popup ─────────────────────────────────────
 
+fn draw_confirm_quit_popup(f: &mut Frame, app: &App, area: Rect) {
+    let drafts = app.diff_view.as_ref().map_or(0, |dv| dv.draft_comments.len());
+    let resolves = app.diff_view.as_ref().map_or(0, |dv| dv.pending_resolves.len());
+
+    let w = 50u16.min(area.width.saturating_sub(4));
+    let h = 7u16;
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup_area = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Unsaved drafts ")
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let mut detail_parts = Vec::new();
+    if drafts > 0 {
+        detail_parts.push(format!("{} draft comment{}", drafts, if drafts == 1 { "" } else { "s" }));
+    }
+    if resolves > 0 {
+        detail_parts.push(format!("{} pending resolve{}", resolves, if resolves == 1 { "" } else { "s" }));
+    }
+    let detail = detail_parts.join(", ");
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  You have {}", detail),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "  that haven't been submitted.",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y ", Style::default().fg(Color::Red)),
+            Span::styled("discard & quit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("any key ", Style::default().fg(Color::Green)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    f.render_widget(Paragraph::new(lines).block(block), popup_area);
+}
 
 // ── Approve popup ──────────────────────────────────────────
 
@@ -818,6 +918,82 @@ fn draw_approve_popup(f: &mut Frame, popup: &crate::app::ApprovePopup, area: Rec
     f.render_widget(Paragraph::new(lines).block(block), popup_area);
 }
 
+fn draw_comment_popup(f: &mut Frame, popup: &crate::app::CommentPopup, area: Rect) {
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let h = 10u16;
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup_area = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, popup_area);
+
+    let border_color = if popup.result_msg.is_some() {
+        Color::Green
+    } else {
+        Color::Cyan
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Comment #{} ", popup.pr_number))
+        .border_style(Style::default().fg(border_color));
+
+    if let Some(msg) = &popup.result_msg {
+        let color = if msg.starts_with('✓') { Color::Green } else { Color::Red };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(format!("  {}", msg), Style::default().fg(color))),
+            Line::from(""),
+            Line::from(Span::styled("  Press any key to close", Style::default().fg(Color::DarkGray))),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), popup_area);
+        return;
+    }
+
+    if popup.submitting {
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {} Posting comment...", NERD_REFRESH),
+                Style::default().fg(Color::Yellow),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), popup_area);
+        return;
+    }
+
+    let max_t = (w as usize).saturating_sub(6);
+    let title = if popup.pr_title.len() > max_t {
+        format!("{}…", &popup.pr_title[..max_t.saturating_sub(1)])
+    } else {
+        popup.pr_title.clone()
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("  {}", title),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Comment:",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            format!("  ▎{}", popup.body),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Enter ", Style::default().fg(Color::Green)),
+            Span::styled("submit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Red)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    f.render_widget(Paragraph::new(lines).block(block), popup_area);
+}
+
 // ── Diff view (two-pane) ───────────────────────────────────
 
 fn draw_diff_view(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
@@ -847,7 +1023,7 @@ fn draw_diff_view(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
         f.render_widget(Clear, popup_area);
 
         let title = if dv.loading_review {
-            format!(" {} {} Review [{}] ", NERD_REFRESH, app.config.ai.name, app.config.ai.command)
+            format!(" {} Review [{}] {} ", app.config.ai.name, app.config.ai.command, spinner(app.frame))
         } else {
             format!(" {} Review [{}] (done) ", app.config.ai.name, app.config.ai.command)
         };
@@ -1455,8 +1631,7 @@ fn draw_input_overlay(f: &mut Frame, dv: &DiffView, diff_area: Rect) {
     f.set_cursor_position((cursor_x, cursor_y));
 }
 
-fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, area: Rect) {
-    let loading = if dv.loading_review { " \u{f450} AI reviewing… │" } else { "" };
+fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, frame: usize, area: Rect) {
     let threads = dv.threads.iter().filter(|t| !t.is_resolved).count();
     let ai_pending = dv.claude_comments.iter().filter(|c| c.accepted.is_none()).count();
     let drafts = dv.draft_comments.len();
@@ -1471,15 +1646,85 @@ fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, area: Rect) {
         return;
     }
 
+    let dim = Style::default().fg(Color::DarkGray);
+    let key = Style::default().fg(Color::Rgb(180, 180, 200));
+    let sep = Span::styled(" │ ", dim);
+
+    let mut spans: Vec<Span> = Vec::new();
+
+    // Always-visible keys
+    spans.push(Span::styled(" ↑↓", key));
+    spans.push(Span::styled(" scroll", dim));
+    spans.push(sep.clone());
+    spans.push(Span::styled("n/N", key));
+    spans.push(Span::styled(" comments", dim));
+    spans.push(sep.clone());
+    spans.push(Span::styled("{}", key));
+    spans.push(Span::styled(" resize", dim));
+    spans.push(sep.clone());
+    spans.push(Span::styled("a", key));
+    spans.push(Span::styled(" add", dim));
+
+    // Context-dependent: only show when applicable
+    let on_thread = dv.has_thread_at_cursor();
+    let on_unresolved = dv.has_unresolved_thread_at_cursor();
+    let on_ai = dv.has_pending_ai_at_cursor();
+
+    if on_thread {
+        spans.push(sep.clone());
+        spans.push(Span::styled("r", key));
+        spans.push(Span::styled(" reply", dim));
+    }
+    if on_unresolved {
+        spans.push(sep.clone());
+        spans.push(Span::styled("R", key));
+        spans.push(Span::styled(" resolve", dim));
+    }
+    if on_ai {
+        spans.push(sep.clone());
+        spans.push(Span::styled("a", key));
+        spans.push(Span::styled(" accept", dim));
+        spans.push(sep.clone());
+        spans.push(Span::styled("e", key));
+        spans.push(Span::styled(" edit", dim));
+        spans.push(sep.clone());
+        spans.push(Span::styled("d", key));
+        spans.push(Span::styled(" discard", dim));
+    }
+
+    spans.push(sep.clone());
+    spans.push(Span::styled("c", key));
+    spans.push(Span::styled(" ai", dim));
+
+    // Submit only when there are pending drafts/resolves
     let resolves = dv.pending_resolves.len();
     let has_pending = drafts > 0 || resolves > 0;
-    let submit_hint = if has_pending { " │ S submit" } else { "" };
-    let resolve_count = if resolves > 0 { format!(" resolve:{}", resolves) } else { String::new() };
-    let info = format!(
-        " ↑↓ scroll │ n/N comments │ a add/accept │ r reply │ R resolve │ c ai │ e edit │ d discard{} │ q back {}│ threads:{} ai:{} drafts:{}{}",
-        submit_hint, loading, threads, ai_pending, drafts, resolve_count
-    );
+    if has_pending {
+        spans.push(sep.clone());
+        spans.push(Span::styled("S", key));
+        spans.push(Span::styled(" submit", dim));
+    }
 
-    let bar = Paragraph::new(Span::styled(info, Style::default().fg(Color::DarkGray)));
+    spans.push(sep.clone());
+    spans.push(Span::styled("q", key));
+    spans.push(Span::styled(" back", dim));
+
+    if dv.loading_review {
+        spans.push(sep.clone());
+        spans.push(Span::styled(
+            format!("{} AI reviewing…", spinner(frame)),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    // Stats
+    let resolve_count = if resolves > 0 { format!(" resolve:{}", resolves) } else { String::new() };
+    spans.push(Span::styled(
+        format!(" │ threads:{} ai:{} drafts:{}{}",
+            threads, ai_pending, drafts, resolve_count),
+        dim,
+    ));
+
+    let bar = Paragraph::new(Line::from(spans));
     f.render_widget(bar, area);
 }

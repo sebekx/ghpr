@@ -29,6 +29,7 @@ pub enum BgMsg {
     ClaudeReviewParsed(Vec<ClaudeComment>),
     ClaudeReviewOutput(String),
     ApproveResult(Result<(), String>),
+    CommentResult(Result<(), String>),
     SubmitResult(Result<(usize, String), String>),
 }
 
@@ -73,11 +74,26 @@ pub struct App {
     pending_claude: Option<Vec<ClaudeComment>>,
     pub file_pane_width: u16,
     pub approve_popup: Option<ApprovePopup>,
+    pub comment_popup: Option<CommentPopup>,
     pub highlighter: Highlighter,
     pub config: Config,
     /// Search filter mode: if Some, user is typing a filter
     pub search_mode: bool,
     pub search_query: String,
+    /// Index in flat_prs where the "approved by me" section starts (None if no split)
+    pub approved_separator: Option<usize>,
+    /// Frame counter for spinner animation
+    pub frame: usize,
+    /// Pending quit confirmation (shows when there are unsaved drafts)
+    pub confirm_quit: Option<ConfirmQuit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConfirmQuit {
+    /// Quit the entire app
+    App,
+    /// Close diff view back to PR list
+    CloseDiff,
 }
 
 pub struct ApprovePopup {
@@ -85,6 +101,15 @@ pub struct ApprovePopup {
     pub pr_number: u64,
     pub pr_title: String,
     pub comment: String,
+    pub submitting: bool,
+    pub result_msg: Option<String>,
+}
+
+pub struct CommentPopup {
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub pr_title: String,
+    pub body: String,
     pub submitting: bool,
     pub result_msg: Option<String>,
 }
@@ -131,10 +156,14 @@ impl App {
             pending_claude: None,
             file_pane_width: 30,
             approve_popup: None,
+            comment_popup: None,
             highlighter: Highlighter::new(),
             config,
             search_mode: false,
             search_query: String::new(),
+            approved_separator: None,
+            frame: 0,
+            confirm_quit: None,
         }
     }
 
@@ -175,12 +204,60 @@ impl App {
             })
             .collect();
 
-        // Sort by updated_at descending
-        self.flat_prs.sort_by(|a, b| b.pr.updated_at.cmp(&a.pr.updated_at));
+        // Sort by created_at descending (newest first)
+        self.flat_prs.sort_by(|a, b| b.pr.created_at.cmp(&a.pr.created_at));
+
+        // Partition: not-approved-by-me first, then approved-by-me
+        let all_prs: Vec<FlatPr> = self.flat_prs.drain(..).collect();
+        let mut not_approved = Vec::new();
+        let mut approved = Vec::new();
+        for fpr in all_prs {
+            if self.is_approved_by_me(&fpr.repo_name, fpr.pr.number) {
+                approved.push(fpr);
+            } else {
+                not_approved.push(fpr);
+            }
+        }
+
+        self.approved_separator = if !not_approved.is_empty() && !approved.is_empty() {
+            Some(not_approved.len())
+        } else {
+            None
+        };
+
+        self.flat_prs = not_approved;
+        self.flat_prs.extend(approved);
 
         self.pr_index = self.pr_index.min(self.flat_prs.len().saturating_sub(1));
         self.current_diff = None;
         self.diff_pr_key = None;
+    }
+
+    /// Re-partition flat_prs into not-approved / approved sections without rebuilding
+    fn recompute_approved_separator(&mut self) {
+        let all_prs: Vec<FlatPr> = self.flat_prs.drain(..).collect();
+        let mut not_approved = Vec::new();
+        let mut approved = Vec::new();
+        for fpr in all_prs {
+            if self.is_approved_by_me(&fpr.repo_name, fpr.pr.number) {
+                approved.push(fpr);
+            } else {
+                not_approved.push(fpr);
+            }
+        }
+
+        // Preserve created_at descending within each group
+        not_approved.sort_by(|a, b| b.pr.created_at.cmp(&a.pr.created_at));
+        approved.sort_by(|a, b| b.pr.created_at.cmp(&a.pr.created_at));
+
+        self.approved_separator = if !not_approved.is_empty() && !approved.is_empty() {
+            Some(not_approved.len())
+        } else {
+            None
+        };
+
+        self.flat_prs = not_approved;
+        self.flat_prs.extend(approved);
     }
 
     /// Public method to re-apply filter (used by search)
@@ -355,6 +432,25 @@ impl App {
         });
     }
 
+    /// Whether the diff view has unsaved draft comments or pending resolves
+    pub fn has_pending_drafts(&self) -> bool {
+        if let Some(dv) = &self.diff_view {
+            !dv.draft_comments.is_empty() || !dv.pending_resolves.is_empty()
+        } else {
+            false
+        }
+    }
+
+    /// Whether background data is still being fetched (statuses, all repos, etc.)
+    pub fn is_fetching(&self) -> bool {
+        if !self.show_assigned_only && !self.all_repos_loaded {
+            return true;
+        }
+        self.flat_prs.iter().any(|fpr| {
+            !self.pr_statuses.contains_key(&(fpr.repo_name.clone(), fpr.pr.number))
+        })
+    }
+
     /// Request statuses for all visible PRs (batched by repo, deduped)
     pub fn request_all_statuses(&mut self) {
         // Collect all unique repos in current view
@@ -423,6 +519,10 @@ impl App {
         let Some(pr) = self.selected_pr() else { return };
         let result_msg = if pr.draft {
             Some("✗ Cannot approve a draft PR".to_string())
+        } else if pr.user.login == self.username {
+            Some("✗ Cannot approve your own PR".to_string())
+        } else if self.is_approved_by_me(&repo_name, pr.number) {
+            Some("✗ Already approved by you".to_string())
         } else {
             None
         };
@@ -455,6 +555,43 @@ impl App {
             match result {
                 Ok(()) => { let _ = tx.send(BgMsg::ApproveResult(Ok(()))); }
                 Err(e) => { let _ = tx.send(BgMsg::ApproveResult(Err(e.to_string()))); }
+            }
+        });
+    }
+
+    pub fn show_comment_popup(&mut self) {
+        let Some(repo_name) = self.selected_repo_name() else { return };
+        let Some(pr) = self.selected_pr() else { return };
+        self.comment_popup = Some(CommentPopup {
+            repo_name,
+            pr_number: pr.number,
+            pr_title: pr.title.clone(),
+            body: String::new(),
+            submitting: false,
+            result_msg: None,
+        });
+    }
+
+    pub fn submit_comment(&mut self) {
+        let Some(popup) = &self.comment_popup else { return };
+        if popup.submitting || popup.result_msg.is_some() { return; }
+        if popup.body.trim().is_empty() { return; }
+
+        let repo = popup.repo_name.clone();
+        let pr_number = popup.pr_number;
+        let body = popup.body.clone();
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+
+        if let Some(p) = &mut self.comment_popup {
+            p.submitting = true;
+        }
+
+        tokio::spawn(async move {
+            let result = client.post_comment(&repo, pr_number, &body).await;
+            match result {
+                Ok(()) => { let _ = tx.send(BgMsg::CommentResult(Ok(()))); }
+                Err(e) => { let _ = tx.send(BgMsg::CommentResult(Err(e.to_string()))); }
             }
         });
     }
@@ -772,6 +909,8 @@ impl App {
                     for (key, status) in statuses {
                         self.pr_statuses.insert(key, status);
                     }
+                    // Re-partition PRs now that approval info is available
+                    self.recompute_approved_separator();
                 }
                 BgMsg::DiffLoaded(diff) => {
                     // If we're entering diff view, create the DiffView
@@ -857,6 +996,17 @@ impl App {
                                     self.pr_statuses.remove(&key);
                                 }
                                 self.request_all_statuses();
+                            }
+                            Err(e) => popup.result_msg = Some(format!("✗ Failed: {}", e)),
+                        }
+                    }
+                }
+                BgMsg::CommentResult(result) => {
+                    if let Some(popup) = &mut self.comment_popup {
+                        popup.submitting = false;
+                        match result {
+                            Ok(()) => {
+                                popup.result_msg = Some("✓ Comment posted!".to_string());
                             }
                             Err(e) => popup.result_msg = Some(format!("✗ Failed: {}", e)),
                         }

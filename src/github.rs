@@ -425,6 +425,31 @@ impl GithubClient {
         Ok(())
     }
 
+    /// Post a general comment on a PR (issue comment)
+    pub async fn post_comment(&self, repo: &str, pr_number: u64, body: &str) -> Result<()> {
+        let url = format!(
+            "https://api.github.com/repos/{}/issues/{}/comments",
+            repo, pr_number
+        );
+        let json = serde_json::json!({ "body": body });
+        let resp = self
+            .client
+            .post(&url)
+            .header(reqwest::header::USER_AGENT, "ghpr-tui")
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", self.token))
+            .header(reqwest::header::ACCEPT, "application/vnd.github.v3+json")
+            .json(&json)
+            .send()
+            .await
+            .context("Failed to post comment")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("GitHub API error {}: {}", status, text);
+        }
+        Ok(())
+    }
+
     /// Submit a review with new comments and reply to existing threads
     pub async fn submit_review(
         &self,

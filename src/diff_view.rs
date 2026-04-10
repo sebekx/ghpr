@@ -594,6 +594,42 @@ impl DiffView {
         self.input_buffer.clear();
     }
 
+    /// Check if there's a thread near the cursor (±3 lines)
+    pub fn has_thread_at_cursor(&self) -> bool {
+        for offset in 0..=3 {
+            let lines_to_check: Vec<usize> = if offset == 0 {
+                vec![self.cursor_line]
+            } else {
+                vec![self.cursor_line.saturating_sub(offset), self.cursor_line + offset]
+            };
+            for li in lines_to_check {
+                if self.line_threads.contains_key(&li) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if there's an unresolved thread near the cursor (±3 lines)
+    pub fn has_unresolved_thread_at_cursor(&self) -> bool {
+        for offset in 0..=3 {
+            let lines_to_check: Vec<usize> = if offset == 0 {
+                vec![self.cursor_line]
+            } else {
+                vec![self.cursor_line.saturating_sub(offset), self.cursor_line + offset]
+            };
+            for li in lines_to_check {
+                if let Some(indices) = self.line_threads.get(&li) {
+                    if indices.iter().any(|&ti| self.threads.get(ti).map_or(false, |t| !t.is_resolved)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Check if there's a pending AI comment near the cursor
     pub fn has_pending_ai_at_cursor(&self) -> bool {
         !self.find_nearest_claude().is_empty()
