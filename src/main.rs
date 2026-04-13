@@ -3,6 +3,7 @@ mod config;
 mod diff_view;
 mod github;
 mod highlight;
+mod input;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -133,16 +134,14 @@ fn run_app(
                     } else {
                         match key.code {
                             KeyCode::Enter => app.submit_comment(),
-                            KeyCode::Esc | KeyCode::Char('q') => { app.comment_popup = None; }
-                            KeyCode::Backspace => {
-                                if let Some(p) = &mut app.comment_popup { p.body.pop(); }
-                            }
-                            KeyCode::Char(c) => {
+                            KeyCode::Esc => { app.comment_popup = None; }
+                            _ => {
                                 if let Some(p) = &mut app.comment_popup {
-                                    if !p.submitting { p.body.push(c); }
+                                    if !p.submitting {
+                                        input::handle_text_key(&mut p.body, &mut p.cursor, &key);
+                                    }
                                 }
                             }
-                            _ => {}
                         }
                     }
                     continue;
@@ -157,16 +156,14 @@ fn run_app(
                     } else {
                         match key.code {
                             KeyCode::Enter => app.submit_approve(),
-                            KeyCode::Esc | KeyCode::Char('q') => { app.approve_popup = None; }
-                            KeyCode::Backspace => {
-                                if let Some(p) = &mut app.approve_popup { p.comment.pop(); }
-                            }
-                            KeyCode::Char(c) => {
+                            KeyCode::Esc => { app.approve_popup = None; }
+                            _ => {
                                 if let Some(p) = &mut app.approve_popup {
-                                    if !p.submitting { p.comment.push(c); }
+                                    if !p.submitting {
+                                        input::handle_text_key(&mut p.comment, &mut p.cursor, &key);
+                                    }
                                 }
                             }
-                            _ => {}
                         }
                     }
                     continue;
@@ -208,12 +205,16 @@ fn run_app(
                         match key.code {
                             KeyCode::Esc => dv.cancel_input(),
                             KeyCode::Enter => dv.submit_input(),
-                            KeyCode::Backspace => { dv.input_buffer.pop(); }
                             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 dv.toggle_resolve();
                             }
-                            KeyCode::Char(c) => dv.input_buffer.push(c),
-                            _ => {}
+                            _ => {
+                                input::handle_text_key(
+                                    &mut dv.input_buffer,
+                                    &mut dv.input_cursor,
+                                    &key,
+                                );
+                            }
                         }
                         continue;
                     }

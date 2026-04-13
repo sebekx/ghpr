@@ -15,6 +15,7 @@ pub struct DiffView {
     pub draft_comments: Vec<DraftComment>,
     pub input_mode: Option<InputMode>,
     pub input_buffer: String,
+    pub input_cursor: usize,
     pub pr_number: u64,
     pub repo_name: String,
     pub loading_review: bool,
@@ -112,6 +113,7 @@ impl DiffView {
             draft_comments: Vec::new(),
             input_mode: None,
             input_buffer: String::new(),
+            input_cursor: 0,
             pr_number,
             repo_name,
             loading_review: false,
@@ -498,6 +500,7 @@ impl DiffView {
             diff_line: self.cursor_line,
         });
         self.input_buffer.clear();
+        self.input_cursor = 0;
     }
 
     pub fn start_reply(&mut self) {
@@ -513,6 +516,7 @@ impl DiffView {
                     if let Some(&ti) = thread_indices.first() {
                         self.input_mode = Some(InputMode::Reply { thread_idx: ti, resolve: false });
                         self.input_buffer.clear();
+                        self.input_cursor = 0;
                         return;
                     }
                 }
@@ -580,6 +584,7 @@ impl DiffView {
             None => {}
         }
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.input_mode = None;
     }
 
@@ -592,6 +597,7 @@ impl DiffView {
     pub fn cancel_input(&mut self) {
         self.input_mode = None;
         self.input_buffer.clear();
+        self.input_cursor = 0;
     }
 
     /// Check if there's a thread near the cursor (±3 lines)
@@ -769,6 +775,7 @@ impl DiffView {
             if let Some(cc) = self.claude_comments.get(ci) {
                 if cc.accepted.is_none() {
                     self.input_buffer = cc.body.clone();
+                    self.input_cursor = self.input_buffer.len();
                     self.input_mode = Some(InputMode::EditClaude { claude_idx: ci });
                 }
             }

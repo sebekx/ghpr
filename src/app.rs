@@ -107,6 +107,7 @@ pub struct ApprovePopup {
     pub pr_number: u64,
     pub pr_title: String,
     pub comment: String,
+    pub cursor: usize,
     pub submitting: bool,
     pub result_msg: Option<String>,
 }
@@ -116,6 +117,7 @@ pub struct CommentPopup {
     pub pr_number: u64,
     pub pr_title: String,
     pub body: String,
+    pub cursor: usize,
     pub submitting: bool,
     pub result_msg: Option<String>,
 }
@@ -620,6 +622,7 @@ impl App {
             pr_number: pr.number,
             pr_title: pr.title.clone(),
             comment: String::new(),
+            cursor: 0,
             submitting: false,
             result_msg,
         });
@@ -656,6 +659,7 @@ impl App {
             pr_number: pr.number,
             pr_title: pr.title.clone(),
             body: String::new(),
+            cursor: 0,
             submitting: false,
             result_msg: None,
         });

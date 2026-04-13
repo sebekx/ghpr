@@ -917,6 +917,13 @@ fn draw_approve_popup(f: &mut Frame, popup: &crate::app::ApprovePopup, area: Rec
     ];
 
     f.render_widget(Paragraph::new(lines).block(block), popup_area);
+
+    // Place terminal cursor on the input line at the cursor offset
+    let cursor_offset = popup.cursor.min(popup.comment.len()) as u16;
+    let cursor_x = (popup_area.x + 1 + 3 + cursor_offset)
+        .min(popup_area.x + popup_area.width.saturating_sub(2));
+    let cursor_y = popup_area.y + 1 + 3; // border + (title, blank, label) → input row
+    f.set_cursor_position((cursor_x, cursor_y));
 }
 
 fn draw_comment_popup(f: &mut Frame, popup: &crate::app::CommentPopup, area: Rect) {
@@ -993,6 +1000,13 @@ fn draw_comment_popup(f: &mut Frame, popup: &crate::app::CommentPopup, area: Rec
     ];
 
     f.render_widget(Paragraph::new(lines).block(block), popup_area);
+
+    // Place terminal cursor on the input line at the cursor offset
+    let cursor_offset = popup.cursor.min(popup.body.len()) as u16;
+    let cursor_x = (popup_area.x + 1 + 3 + cursor_offset)
+        .min(popup_area.x + popup_area.width.saturating_sub(2));
+    let cursor_y = popup_area.y + 1 + 3; // border + (title, blank, label) → input row
+    f.set_cursor_position((cursor_x, cursor_y));
 }
 
 // ── Diff view (two-pane) ───────────────────────────────────
@@ -1641,8 +1655,9 @@ fn draw_input_overlay(f: &mut Frame, dv: &DiffView, diff_area: Rect) {
         .wrap(Wrap { trim: false });
     f.render_widget(paragraph, popup_area);
 
-    // Place terminal cursor at end of input text
-    let cursor_x = popup_area.x + 1 + 2 + dv.input_buffer.len() as u16; // border + " ▎" + text
+    // Place terminal cursor at the input cursor offset
+    let cursor_offset = dv.input_cursor.min(dv.input_buffer.len()) as u16;
+    let cursor_x = popup_area.x + 1 + 2 + cursor_offset; // border + " ▎" + text up to cursor
     let cursor_y = popup_area.y + 1 + resolve_lines; // border + resolve line if present
     let cursor_x = cursor_x.min(popup_area.x + popup_area.width.saturating_sub(2));
     f.set_cursor_position((cursor_x, cursor_y));
