@@ -692,6 +692,76 @@ impl DiffView {
         }
     }
 
+    /// Find the nearest thread index within ±3 lines of cursor (prefers unresolved)
+    fn find_nearest_thread(&self) -> Option<usize> {
+        for offset in 0..=3 {
+            let lines_to_check: Vec<usize> = if offset == 0 {
+                vec![self.cursor_line]
+            } else {
+                vec![self.cursor_line.saturating_sub(offset), self.cursor_line + offset]
+            };
+            for li in lines_to_check {
+                if let Some(indices) = self.line_threads.get(&li) {
+                    // Prefer unresolved
+                    if let Some(&ti) = indices
+                        .iter()
+                        .find(|&&ti| self.threads.get(ti).map_or(false, |t| !t.is_resolved))
+                    {
+                        return Some(ti);
+                    }
+                    if let Some(&ti) = indices.first() {
+                        return Some(ti);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Render a thread as plain text suitable for clipboard
+    fn format_thread(&self, ti: usize) -> Option<String> {
+        let thread = self.threads.get(ti)?;
+        let mut out = String::new();
+        let line_str = thread
+            .line
+            .map(|l| format!(":{}", l))
+            .unwrap_or_default();
+        let resolved = if thread.is_resolved { " [resolved]" } else { "" };
+        out.push_str(&format!(
+            "{}#{} — {}{}{}\n",
+            self.repo_name, self.pr_number, thread.path, line_str, resolved
+        ));
+        for (i, c) in thread.comments.iter().enumerate() {
+            out.push('\n');
+            let prefix = if i == 0 { "" } else { "↳ " };
+            out.push_str(&format!("{}{} ({})\n", prefix, c.author, c.created_at));
+            out.push_str(c.body.trim_end());
+            out.push('\n');
+        }
+        Some(out)
+    }
+
+    /// Copy the thread at cursor to the system clipboard. Sets submit_status with the result.
+    pub fn copy_thread_at_cursor(&mut self) {
+        let Some(ti) = self.find_nearest_thread() else {
+            self.submit_status = Some("No thread at cursor to copy".to_string());
+            return;
+        };
+        let Some(text) = self.format_thread(ti) else {
+            self.submit_status = Some("Could not format thread".to_string());
+            return;
+        };
+        match copy_to_clipboard(&text) {
+            Ok(tool) => {
+                let n = self.threads.get(ti).map(|t| t.comments.len()).unwrap_or(0);
+                self.submit_status = Some(format!("Copied thread ({} comments) via {}", n, tool));
+            }
+            Err(e) => {
+                self.submit_status = Some(format!("Copy failed: {}", e));
+            }
+        }
+    }
+
     /// Edit Claude comment at/near cursor — opens input with existing text
     pub fn edit_claude_at_cursor(&mut self) {
         let indices = self.find_nearest_claude();
@@ -927,4 +997,45 @@ fn count_wrapped_lines(text: &str, width: usize) -> usize {
         }
     }
     count.max(1)
+}
+
+/// Copy `text` to the system clipboard via an external tool.
+/// Tries pbcopy → wl-copy → xclip → xsel and returns the name of the tool used.
+fn copy_to_clipboard(text: &str) -> Result<&'static str, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let candidates: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+
+    let mut last_err = String::from("no clipboard tool found (install pbcopy/wl-copy/xclip/xsel)");
+    for (cmd, args) in candidates {
+        let spawn = Command::new(cmd)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let mut child = match spawn {
+            Ok(c) => c,
+            Err(_) => continue, // tool not present, try next
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(text.as_bytes()) {
+                last_err = format!("{}: write failed: {}", cmd, e);
+                let _ = child.wait();
+                continue;
+            }
+        }
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(cmd),
+            Ok(status) => last_err = format!("{} exited with {}", cmd, status),
+            Err(e) => last_err = format!("{} wait failed: {}", cmd, e),
+        }
+    }
+    Err(last_err)
 }

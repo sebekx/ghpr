@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::diff_view::{ClaudeComment, DiffView};
-use crate::github::{CiState, GithubClient, PrStatus, PullRequest, RepoInfo};
+use crate::github::{CiState, Commit, GithubClient, PrStatus, PullRequest, RepoInfo};
 use crate::highlight::Highlighter;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -31,6 +31,7 @@ pub enum BgMsg {
     ApproveResult(Result<(), String>),
     CommentResult(Result<(), String>),
     SubmitResult(Result<(usize, String), String>),
+    CommitsLoaded((String, u64, Vec<Commit>)),
 }
 
 /// A flattened PR entry with its repo name
@@ -86,6 +87,11 @@ pub struct App {
     pub frame: usize,
     /// Pending quit confirmation (shows when there are unsaved drafts)
     pub confirm_quit: Option<ConfirmQuit>,
+    /// Commits of the current PR (chronological, oldest first)
+    pub pr_commits: Vec<Commit>,
+    /// Selected commit range: (start_idx, end_idx) inclusive into pr_commits
+    /// Full range = (0, commits.len() - 1)
+    pub commit_range: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -164,6 +170,8 @@ impl App {
             approved_separator: None,
             frame: 0,
             confirm_quit: None,
+            pr_commits: Vec::new(),
+            commit_range: None,
         }
     }
 
@@ -514,6 +522,87 @@ impl App {
         });
     }
 
+    /// Re-fetch diff using the current commit range
+    pub fn request_diff_for_range(&mut self) {
+        let Some(repo_name) = self.selected_repo_name() else { return };
+        let Some(pr) = self.selected_pr() else { return };
+        let pr_number = pr.number;
+
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        self.loading_diff = true;
+        self.current_diff = None;
+
+        // If no range or full range, use PR diff
+        let use_full = match self.commit_range {
+            None => true,
+            Some((s, e)) => s == 0 && e + 1 == self.pr_commits.len(),
+        };
+
+        if use_full || self.pr_commits.is_empty() {
+            tokio::spawn(async move {
+                match client.fetch_pr_diff(&repo_name, pr_number).await {
+                    Ok(diff) => { let _ = tx.send(BgMsg::DiffLoaded(diff)); }
+                    Err(e) => { let _ = tx.send(BgMsg::DiffLoaded(format!("Error loading diff: {}", e))); }
+                }
+            });
+            return;
+        }
+
+        let (start, end) = self.commit_range.unwrap();
+        // Base = parent of start commit (if exists), otherwise start commit itself
+        let base_sha = self.pr_commits[start]
+            .parents
+            .first()
+            .map(|p| p.sha.clone())
+            .unwrap_or_else(|| self.pr_commits[start].sha.clone());
+        let head_sha = self.pr_commits[end].sha.clone();
+
+        tokio::spawn(async move {
+            match client.fetch_compare_diff(&repo_name, &base_sha, &head_sha).await {
+                Ok(diff) => { let _ = tx.send(BgMsg::DiffLoaded(diff)); }
+                Err(e) => { let _ = tx.send(BgMsg::DiffLoaded(format!("Error loading diff: {}", e))); }
+            }
+        });
+    }
+
+    /// Fetch commits for the PR
+    pub fn fetch_commits(&mut self) {
+        let Some(repo_name) = self.selected_repo_name() else { return };
+        let Some(pr) = self.selected_pr() else { return };
+        let pr_number = pr.number;
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let repo = repo_name.clone();
+        tokio::spawn(async move {
+            if let Ok(commits) = client.fetch_pr_commits(&repo, pr_number).await {
+                let _ = tx.send(BgMsg::CommitsLoaded((repo, pr_number, commits)));
+            }
+        });
+    }
+
+    /// Adjust commit range and re-fetch diff
+    pub fn move_range_start(&mut self, delta: i32) {
+        if self.pr_commits.is_empty() { return; }
+        let Some((s, e)) = self.commit_range else { return };
+        let new_s = (s as i32 + delta).max(0).min(e as i32) as usize;
+        if new_s != s {
+            self.commit_range = Some((new_s, e));
+            self.request_diff_for_range();
+        }
+    }
+
+    pub fn move_range_end(&mut self, delta: i32) {
+        if self.pr_commits.is_empty() { return; }
+        let Some((s, e)) = self.commit_range else { return };
+        let max = self.pr_commits.len() as i32 - 1;
+        let new_e = (e as i32 + delta).max(s as i32).min(max) as usize;
+        if new_e != e {
+            self.commit_range = Some((s, new_e));
+            self.request_diff_for_range();
+        }
+    }
+
     pub fn show_approve_popup(&mut self) {
         let Some(repo_name) = self.selected_repo_name() else { return };
         let Some(pr) = self.selected_pr() else { return };
@@ -735,6 +824,8 @@ impl App {
         self.pending_claude = None;
         self.tree_index = 0;
         self.diff_focus = DiffFocus::Files;
+        self.pr_commits.clear();
+        self.commit_range = None;
         let Some(repo_name) = self.selected_repo_name() else { return };
         let Some(pr) = self.selected_pr().cloned() else { return };
 
@@ -742,6 +833,9 @@ impl App {
         self.current_diff = None;
         self.diff_pr_key = None;
         self.request_diff();
+
+        // Fetch commits in parallel so the range can be adjusted later
+        self.fetch_commits();
 
         self.fetch_threads(&repo_name, &pr);
 
@@ -912,19 +1006,48 @@ impl App {
                     // Re-partition PRs now that approval info is available
                     self.recompute_approved_separator();
                 }
+                BgMsg::CommitsLoaded((repo, pr_num, commits)) => {
+                    // Only apply if this is still for the selected PR
+                    if self.selected_repo_name().as_deref() == Some(&repo)
+                        && self.selected_pr().map(|p| p.number) == Some(pr_num)
+                    {
+                        if !commits.is_empty() {
+                            let end = commits.len() - 1;
+                            self.pr_commits = commits;
+                            self.commit_range = Some((0, end));
+                        }
+                    }
+                }
                 BgMsg::DiffLoaded(diff) => {
-                    // If we're entering diff view, create the DiffView
-                    if self.active_tab == Tab::Diff && self.diff_view.is_none() {
+                    if self.active_tab == Tab::Diff {
                         let repo = self.selected_repo_name().unwrap_or_default();
                         let pr_num = self.selected_pr().map(|p| p.number).unwrap_or(0);
+                        // Preserve existing threads/claude comments and drafts when rebuilding
+                        let (existing_threads, existing_claude, existing_drafts, existing_resolves) =
+                            if let Some(dv) = &self.diff_view {
+                                (
+                                    dv.threads.clone(),
+                                    dv.claude_comments.clone(),
+                                    dv.draft_comments.clone(),
+                                    dv.pending_resolves.clone(),
+                                )
+                            } else {
+                                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                            };
                         let mut dv = DiffView::new(&diff, repo, pr_num);
-                        // Apply any buffered threads/claude comments
+                        // Apply any buffered threads/claude comments (from initial load)
                         if let Some(threads) = self.pending_threads.take() {
                             dv.set_threads(threads);
+                        } else if !existing_threads.is_empty() {
+                            dv.set_threads(existing_threads);
                         }
                         if let Some(comments) = self.pending_claude.take() {
                             dv.set_claude_comments(comments);
+                        } else if !existing_claude.is_empty() {
+                            dv.set_claude_comments(existing_claude);
                         }
+                        dv.draft_comments = existing_drafts;
+                        dv.pending_resolves = existing_resolves;
                         // Set tree_index to first file (skip dirs) and sync
                         self.tree_index = dv.tree.iter()
                             .position(|n| !n.is_dir)

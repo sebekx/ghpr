@@ -95,6 +95,34 @@ pub struct ReviewComment {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct Commit {
+    pub sha: String,
+    pub commit: CommitDetails,
+    #[serde(default)]
+    pub parents: Vec<CommitParent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct CommitDetails {
+    pub message: String,
+    pub author: CommitAuthor,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct CommitAuthor {
+    pub name: String,
+    #[serde(default)]
+    pub date: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitParent {
+    pub sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct PrFile {
     pub filename: String,
     pub status: String,
@@ -393,6 +421,34 @@ impl GithubClient {
         self.get_text(&format!(
             "https://api.github.com/repos/{}/pulls/{}",
             repo, pr_number
+        ))
+        .await
+    }
+
+    /// Fetch commits for a PR (chronological, oldest first)
+    pub async fn fetch_pr_commits(&self, repo: &str, pr_number: u64) -> Result<Vec<Commit>> {
+        let mut all = Vec::new();
+        let mut page = 1;
+        loop {
+            let url = format!(
+                "https://api.github.com/repos/{}/pulls/{}/commits?per_page=100&page={}",
+                repo, pr_number, page
+            );
+            let batch: Vec<Commit> = self.get(&url).await?;
+            let n = batch.len();
+            all.extend(batch);
+            if n < 100 { break; }
+            page += 1;
+            if page > 5 { break; } // Cap at 500 commits
+        }
+        Ok(all)
+    }
+
+    /// Fetch diff between two commit SHAs
+    pub async fn fetch_compare_diff(&self, repo: &str, base_sha: &str, head_sha: &str) -> Result<String> {
+        self.get_text(&format!(
+            "https://api.github.com/repos/{}/compare/{}...{}",
+            repo, base_sha, head_sha
         ))
         .await
     }

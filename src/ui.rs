@@ -228,6 +228,7 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         h("Enter", Color::DarkGray, "Load diff"),
         h("r", Color::DarkGray, "Refresh"),
         h("o", Color::DarkGray, "Open in browser"),
+        h("y", Color::DarkGray, "Copy thread (in diff view)"),
         h("?", Color::DarkGray, "Help"),
         h("q", Color::DarkGray, "Quit"),
     ];
@@ -997,13 +998,29 @@ fn draw_comment_popup(f: &mut Frame, popup: &crate::app::CommentPopup, area: Rec
 // ── Diff view (two-pane) ───────────────────────────────────
 
 fn draw_diff_view(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
+    // Reserve a row at the top for the commit range indicator if we have commits
+    let show_range_bar = !app.pr_commits.is_empty();
+    let (range_area, body_area) = if show_range_bar {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        (Some(rows[0]), rows[1])
+    } else {
+        (None, area)
+    };
+
+    if let Some(ra) = range_area {
+        draw_commit_range_bar(f, app, ra);
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(app.file_pane_width.min(area.width / 2)),
+            Constraint::Length(app.file_pane_width.min(body_area.width / 2)),
             Constraint::Min(0),
         ])
-        .split(area);
+        .split(body_area);
 
     draw_file_tree(f, app, dv, chunks[0]);
     draw_diff_content(f, app, dv, chunks[1]);
@@ -1631,6 +1648,65 @@ fn draw_input_overlay(f: &mut Frame, dv: &DiffView, diff_area: Rect) {
     f.set_cursor_position((cursor_x, cursor_y));
 }
 
+fn draw_commit_range_bar(f: &mut Frame, app: &App, area: Rect) {
+    let commits = &app.pr_commits;
+    if commits.is_empty() { return; }
+    let (start, end) = app.commit_range.unwrap_or((0, commits.len() - 1));
+    let total = commits.len();
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let marker_active = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let marker_inactive = Style::default().fg(Color::Rgb(100, 140, 180));
+
+    // Slider visual: one char per commit, up to a cap
+    let max_slots = (area.width.saturating_sub(40) as usize).min(40).max(5);
+    let slots = total.min(max_slots);
+    let scale = |i: usize| -> usize {
+        if total <= 1 { 0 } else { i * (slots.saturating_sub(1)) / (total - 1) }
+    };
+    let start_slot = scale(start);
+    let end_slot = scale(end);
+
+    let mut slider_spans = Vec::new();
+    for i in 0..slots {
+        let in_range = i >= start_slot && i <= end_slot;
+        let ch = if in_range { "●" } else { "·" };
+        let style = if in_range { marker_active } else { marker_inactive };
+        slider_spans.push(Span::styled(format!("{} ", ch), style));
+    }
+
+    let full_range = start == 0 && end == total - 1;
+    let range_text = if full_range {
+        format!("All commits ({})", total)
+    } else if start == end {
+        format!("Commit {}/{}", start + 1, total)
+    } else {
+        format!("Commits {}..{}/{}", start + 1, end + 1, total)
+    };
+
+    // Short message title from the start or end commit
+    let end_msg: String = commits.get(end)
+        .map(|c| c.commit.message.lines().next().unwrap_or("").to_string())
+        .unwrap_or_default();
+    let max_msg = (area.width as usize).saturating_sub(slots + range_text.len() + 20);
+    let msg_trunc = if end_msg.len() > max_msg {
+        format!("{}…", &end_msg.chars().take(max_msg.saturating_sub(1)).collect::<String>())
+    } else {
+        end_msg
+    };
+
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::styled(" ", dim));
+    spans.extend(slider_spans);
+    spans.push(Span::styled(format!("  {} ", range_text), dim));
+    if !msg_trunc.is_empty() {
+        spans.push(Span::styled(format!("│ {}", msg_trunc), Style::default().fg(Color::White)));
+    }
+
+    let bar = Paragraph::new(Line::from(spans));
+    f.render_widget(bar, area);
+}
+
 fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, frame: usize, area: Rect) {
     let threads = dv.threads.iter().filter(|t| !t.is_resolved).count();
     let ai_pending = dv.claude_comments.iter().filter(|c| c.accepted.is_none()).count();
@@ -1659,8 +1735,14 @@ fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, frame: usize, area: R
     spans.push(Span::styled("n/N", key));
     spans.push(Span::styled(" comments", dim));
     spans.push(sep.clone());
-    spans.push(Span::styled("{}", key));
+    spans.push(Span::styled("<>", key));
     spans.push(Span::styled(" resize", dim));
+    spans.push(sep.clone());
+    spans.push(Span::styled("[]", key));
+    spans.push(Span::styled(" start", dim));
+    spans.push(sep.clone());
+    spans.push(Span::styled("{}", key));
+    spans.push(Span::styled(" end", dim));
     spans.push(sep.clone());
     spans.push(Span::styled("a", key));
     spans.push(Span::styled(" add", dim));
@@ -1674,6 +1756,9 @@ fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, frame: usize, area: R
         spans.push(sep.clone());
         spans.push(Span::styled("r", key));
         spans.push(Span::styled(" reply", dim));
+        spans.push(sep.clone());
+        spans.push(Span::styled("y", key));
+        spans.push(Span::styled(" copy", dim));
     }
     if on_unresolved {
         spans.push(sep.clone());

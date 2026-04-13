@@ -282,13 +282,19 @@ fn run_app(
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             dv.page_up(20);
                         }
-                        // { / } — resize panes
-                        KeyCode::Char('{') => {
+                        // < / > — resize panes
+                        KeyCode::Char('<') => {
                             app.file_pane_width = app.file_pane_width.saturating_sub(3).max(15);
                         }
-                        KeyCode::Char('}') => {
+                        KeyCode::Char('>') => {
                             app.file_pane_width = (app.file_pane_width + 3).min(80);
                         }
+                        // [ / ] — move commit range start (narrow / widen left edge)
+                        KeyCode::Char('[') => app.move_range_start(-1),
+                        KeyCode::Char(']') => app.move_range_start(1),
+                        // { / } — move commit range end (widen / narrow right edge)
+                        KeyCode::Char('{') => app.move_range_end(-1),
+                        KeyCode::Char('}') => app.move_range_end(1),
                         // Comment navigation — works in both panes
                         KeyCode::Char('n') => {
                             if let Some(ti) = dv.jump_next_comment_or_file() {
@@ -325,6 +331,9 @@ fn run_app(
                         }
                         KeyCode::Char('R') => {
                             app.resolve_thread_at_cursor();
+                        }
+                        KeyCode::Char('y') => {
+                            dv.copy_thread_at_cursor();
                         }
                         KeyCode::Char('?') => { app.show_help = true; }
                         _ => {}
