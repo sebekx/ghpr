@@ -1771,9 +1771,6 @@ fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, frame: usize, area: R
         spans.push(sep.clone());
         spans.push(Span::styled("r", key));
         spans.push(Span::styled(" reply", dim));
-        spans.push(sep.clone());
-        spans.push(Span::styled("y", key));
-        spans.push(Span::styled(" copy", dim));
     }
     if on_unresolved {
         spans.push(sep.clone());
@@ -1790,6 +1787,11 @@ fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, frame: usize, area: R
         spans.push(sep.clone());
         spans.push(Span::styled("d", key));
         spans.push(Span::styled(" discard", dim));
+    }
+    if on_thread || on_ai {
+        spans.push(sep.clone());
+        spans.push(Span::styled("y", key));
+        spans.push(Span::styled(" copy", dim));
     }
 
     spans.push(sep.clone());

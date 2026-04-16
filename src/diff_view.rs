@@ -641,7 +641,26 @@ impl DiffView {
         !self.find_nearest_claude().is_empty()
     }
 
-    /// Find nearest Claude comment index within ±3 lines of cursor
+    /// Find nearest Claude comment index within ±3 lines of cursor (any status, for copy)
+    fn find_nearest_claude_any(&self) -> Vec<usize> {
+        for offset in 0..=3 {
+            let lines_to_check: Vec<usize> = if offset == 0 {
+                vec![self.cursor_line]
+            } else {
+                vec![self.cursor_line.saturating_sub(offset), self.cursor_line + offset]
+            };
+            for li in lines_to_check {
+                if let Some(indices) = self.line_claude.get(&li) {
+                    if !indices.is_empty() {
+                        return indices.clone();
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Find nearest pending Claude comment index within ±3 lines of cursor
     fn find_nearest_claude(&self) -> Vec<usize> {
         for offset in 0..=3 {
             let lines_to_check: Vec<usize> = if offset == 0 {
@@ -747,25 +766,68 @@ impl DiffView {
         Some(out)
     }
 
-    /// Copy the thread at cursor to the system clipboard. Sets submit_status with the result.
-    pub fn copy_thread_at_cursor(&mut self) {
-        let Some(ti) = self.find_nearest_thread() else {
-            self.submit_status = Some("No thread at cursor to copy".to_string());
-            return;
+    /// Format a Claude/AI comment as plain text suitable for clipboard
+    fn format_claude_comment(&self, ci: usize) -> Option<String> {
+        let cc = self.claude_comments.get(ci)?;
+        let mut out = String::new();
+        let line_str = if cc.line > 0 {
+            format!(":{}", cc.line)
+        } else {
+            String::new()
         };
-        let Some(text) = self.format_thread(ti) else {
-            self.submit_status = Some("Could not format thread".to_string());
-            return;
+        let status = match cc.accepted {
+            Some(true) => " [accepted]",
+            Some(false) => " [discarded]",
+            None => "",
         };
-        match copy_to_clipboard(&text) {
-            Ok(tool) => {
-                let n = self.threads.get(ti).map(|t| t.comments.len()).unwrap_or(0);
-                self.submit_status = Some(format!("Copied thread ({} comments) via {}", n, tool));
-            }
-            Err(e) => {
-                self.submit_status = Some(format!("Copy failed: {}", e));
+        out.push_str(&format!(
+            "{}#{} — {}{}{}\n",
+            self.repo_name, self.pr_number, cc.file, line_str, status
+        ));
+        if let Some(sev) = &cc.severity {
+            out.push_str(&format!("\n[{}]\n", sev));
+        }
+        out.push('\n');
+        out.push_str(cc.body.trim_end());
+        out.push('\n');
+        Some(out)
+    }
+
+    /// Copy the thread or AI comment at cursor to the system clipboard.
+    pub fn copy_at_cursor(&mut self) {
+        // Try review thread first
+        if let Some(ti) = self.find_nearest_thread() {
+            if let Some(text) = self.format_thread(ti) {
+                match copy_to_clipboard(&text) {
+                    Ok(tool) => {
+                        let n = self.threads.get(ti).map(|t| t.comments.len()).unwrap_or(0);
+                        self.submit_status =
+                            Some(format!("Copied thread ({} comments) via {}", n, tool));
+                    }
+                    Err(e) => {
+                        self.submit_status = Some(format!("Copy failed: {}", e));
+                    }
+                }
+                return;
             }
         }
+        // Fall back to AI comment
+        let claude_indices = self.find_nearest_claude_any();
+        if let Some(&ci) = claude_indices.first() {
+            if let Some(text) = self.format_claude_comment(ci) {
+                match copy_to_clipboard(&text) {
+                    Ok(tool) => {
+                        self.submit_status =
+                            Some(format!("Copied AI comment via {}", tool));
+                    }
+                    Err(e) => {
+                        self.submit_status = Some(format!("Copy failed: {}", e));
+                    }
+                }
+                return;
+            }
+        }
+        self.submit_status = Some("No thread or AI comment at cursor".to_string());
     }
 
     /// Edit Claude comment at/near cursor — opens input with existing text

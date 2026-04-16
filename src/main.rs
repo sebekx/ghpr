@@ -334,7 +334,7 @@ fn run_app(
                             app.resolve_thread_at_cursor();
                         }
                         KeyCode::Char('y') => {
-                            dv.copy_thread_at_cursor();
+                            dv.copy_at_cursor();
                         }
                         KeyCode::Char('?') => { app.show_help = true; }
                         _ => {}
