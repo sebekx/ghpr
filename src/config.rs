@@ -6,6 +6,48 @@ use std::path::PathBuf;
 pub struct Config {
     #[serde(default)]
     pub ai: AiConfig,
+    #[serde(default)]
+    pub auto: AutoConfig,
+}
+
+/// Background polling and automatic review behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoConfig {
+    /// Poll GitHub and run reviews automatically. Off unless you ask for it
+    /// with `ghpr -r 5m`, so ghpr never spends CPU or starts reviews behind
+    /// your back by default.
+    #[serde(default = "default_auto_enabled")]
+    pub enabled: bool,
+
+    /// How often to look for new or updated PRs (seconds, minimum 15).
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+
+    /// How many AI reviews may run at the same time.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+
+    /// Only review PRs where you are a requested reviewer or an assignee.
+    /// PRs you already have a local draft for are always re-reviewed when they
+    /// change, regardless of this setting.
+    #[serde(default = "default_only_assigned")]
+    pub only_assigned: bool,
+}
+
+fn default_auto_enabled() -> bool { false }
+fn default_poll_interval() -> u64 { 60 }
+fn default_max_concurrent() -> usize { 2 }
+fn default_only_assigned() -> bool { true }
+
+impl Default for AutoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_auto_enabled(),
+            poll_interval_secs: default_poll_interval(),
+            max_concurrent: default_max_concurrent(),
+            only_assigned: default_only_assigned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +72,25 @@ pub struct AiConfig {
     /// Output mode: "stream-json" (claude CLI) or "text" (collect all stdout)
     #[serde(default = "default_output_mode")]
     pub output_mode: String,
+
+    /// Lowest severity worth showing: CRITICAL, HIGH, MEDIUM, LOW or INFO.
+    /// Anything below it is dropped as noise. Use "INFO" to keep everything.
+    #[serde(default = "default_min_severity")]
+    pub min_severity: String,
+}
+
+/// Rank a severity name so thresholds can be compared. Returns `None` for a
+/// missing or unrecognised severity — those are always kept, so an agent that
+/// doesn't label its findings never has them silently thrown away.
+pub fn severity_rank(severity: Option<&str>) -> Option<u8> {
+    match severity?.trim().to_uppercase().as_str() {
+        "INFO" => Some(0),
+        "LOW" => Some(1),
+        "MEDIUM" | "MED" => Some(2),
+        "HIGH" => Some(3),
+        "CRITICAL" | "CRIT" => Some(4),
+        _ => None,
+    }
 }
 
 fn default_ai_name() -> String { "AI".to_string() }
@@ -59,6 +120,7 @@ fn default_args() -> Vec<String> {
 }
 fn default_json_marker() -> String { "---GHPR_JSON---".to_string() }
 fn default_output_mode() -> String { "stream-json".to_string() }
+fn default_min_severity() -> String { "MEDIUM".to_string() }
 
 impl Default for AiConfig {
     fn default() -> Self {
@@ -68,13 +130,17 @@ impl Default for AiConfig {
             args: default_args(),
             json_marker: default_json_marker(),
             output_mode: default_output_mode(),
+            min_severity: default_min_severity(),
         }
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { ai: AiConfig::default() }
+        Self {
+            ai: AiConfig::default(),
+            auto: AutoConfig::default(),
+        }
     }
 }
 
@@ -112,21 +178,56 @@ impl Config {
         Ok(path)
     }
 
+    /// Severity threshold for keeping a finding, or `None` to keep everything.
+    pub fn min_severity_rank(&self) -> Option<u8> {
+        severity_rank(Some(&self.ai.min_severity))
+    }
+
+    /// Severities at or above the configured threshold, highest first.
+    fn allowed_severities(&self) -> Vec<&'static str> {
+        const ALL: [(&str, u8); 5] = [
+            ("CRITICAL", 4),
+            ("HIGH", 3),
+            ("MEDIUM", 2),
+            ("LOW", 1),
+            ("INFO", 0),
+        ];
+        let min = self.min_severity_rank().unwrap_or(0);
+        ALL.iter()
+            .filter(|(_, rank)| *rank >= min)
+            .map(|(name, _)| *name)
+            .collect()
+    }
+
     /// Build the system prompt that instructs the AI to output structured JSON.
     pub fn system_prompt(&self) -> String {
+        let allowed = self.allowed_severities();
+        // Ask the agent not to generate what we would only throw away.
+        let threshold = if allowed.len() < 5 {
+            format!(
+                "\nOnly report findings of severity {}. Do NOT report anything less important than {} — such findings must be omitted entirely.",
+                allowed.join(", "),
+                self.ai.min_severity.trim().to_uppercase(),
+            )
+        } else {
+            String::new()
+        };
+
         format!(
             r#"IMPORTANT: After your review, you MUST end your response with a JSON block on a new line starting with {marker} followed by a JSON array of all your file-specific comments. Each element must have:
 - "filename" (full file path)
 - "line" (line number in new file)
-- "severity" (one of: CRITICAL, HIGH, MEDIUM, LOW, INFO)
-- "comment" (your review comment text)
+- "severity" (one of: {allowed})
+- "comment" (your review comment text){threshold}
 Example:
 {marker}
 [{{"filename":"src/app.ts","line":42,"severity":"HIGH","comment":"Consider handling the error"}}]
 If no comments, output:
 {marker}
 []"#,
-            marker = self.ai.json_marker
+            marker = self.ai.json_marker,
+            allowed = allowed.join(", "),
+            threshold = threshold,
         )
     }
 
@@ -165,6 +266,14 @@ const CONFIG_HEADER: &str = r#"# ghpr AI agent configuration
 #   severity  - one of: CRITICAL, HIGH, MEDIUM, LOW, INFO (optional, shown color-coded)
 #   comment   - the review comment text (also accepts "body")
 #
+# Noise filter:
+#   min_severity  - lowest severity kept; anything below it is discarded.
+#                   Defaults to "MEDIUM", so LOW and INFO findings are ignored.
+#                   Set to "INFO" to keep everything, "HIGH" to be stricter.
+#                   Findings with no severity at all are always kept.
+#                   The threshold is also passed to the agent so it doesn't
+#                   waste time producing findings that would be thrown away.
+#
 # Example configs:
 #
 # [ai]
@@ -173,6 +282,7 @@ const CONFIG_HEADER: &str = r#"# ghpr AI agent configuration
 # args = ["-p", "/auto-review-pr {pr_url}", "--append-system-prompt", "{system_prompt}", "--output-format", "stream-json", "--allowedTools", "Bash(gh:*)", "--allowedTools", "Read", "--allowedTools", "Glob", "--allowedTools", "Grep", "--allowedTools", "WebFetch", "--verbose", "--include-partial-messages", "--no-session-persistence"]
 # json_marker = "---GHPR_JSON---"
 # output_mode = "stream-json"
+# min_severity = "MEDIUM"
 #
 # [ai]
 # name = "Custom Agent"
@@ -180,6 +290,18 @@ const CONFIG_HEADER: &str = r#"# ghpr AI agent configuration
 # args = ["review", "--pr", "{pr_url}", "--format", "json"]
 # json_marker = "---GHPR_JSON---"
 # output_mode = "text"
+#
+# Automatic background review. Off by default — turn it on for a session with
+# `ghpr -r 5m`, or set enabled = true here to have it always on.
+#
+# [auto]
+# enabled = false            # poll for new/updated PRs and review them
+# poll_interval_secs = 300   # how often to check (minimum 15); -r overrides
+# max_concurrent = 2         # parallel AI reviews
+# only_assigned = true       # only PRs where you're a reviewer or assignee
+#
+# Draft PRs and your own PRs are never auto-reviewed. Results are stored in
+# ~/.ghpr/drafts/ until you submit the review or the PR is closed.
 "#;
 
 /// Help text shown when no config exists.

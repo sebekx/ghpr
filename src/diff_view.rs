@@ -26,14 +26,24 @@ pub struct DiffView {
     /// Precomputed comment positions for current file: diff_line_index -> list of thread indices
     pub line_threads: HashMap<usize, Vec<usize>>,
     pub line_claude: HashMap<usize, Vec<usize>>,
+    /// Your own standalone draft comments mapped to diff lines for the
+    /// current file (replies live inside their thread instead)
+    pub line_drafts: HashMap<usize, Vec<usize>>,
     /// File-level threads (no line or line not in diff) for current file
     pub file_level_threads: Vec<usize>,
     /// File-level Claude comments (line not in diff) for current file
     pub file_level_claude: Vec<usize>,
+    /// Draft comments whose line is no longer in the diff
+    pub file_level_drafts: Vec<usize>,
     /// Syntax highlight cache: file_index -> highlighted data
     pub highlight_cache: HashMap<usize, HighlightedFile>,
     /// Thread indices pending resolve (draft)
     pub pending_resolves: Vec<usize>,
+    /// Resolve targets loaded from a stored draft whose thread hasn't been
+    /// matched yet — resolved into `pending_resolves` once threads arrive.
+    pub pending_resolve_ids: Vec<u64>,
+    /// Set when draft state changed and needs writing to disk.
+    pub dirty: bool,
     /// Rendered line offset for input overlay positioning (set during draw)
     pub input_target_line: Option<usize>,
 }
@@ -88,7 +98,24 @@ pub struct DraftComment {
     pub line: u64,
     pub body: String,
     pub in_reply_to_thread: Option<usize>,
+    /// Root comment id of the replied-to thread. Survives restarts, unlike
+    /// `in_reply_to_thread`, which is an index into the current `threads`.
+    pub reply_to_comment_id: Option<u64>,
     pub resolve: bool,
+}
+
+/// What the diff cursor is currently pointing at, for the `e` and `d` keys.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CursorTarget {
+    /// AI finding you haven't decided on
+    PendingAi,
+    /// AI finding you accepted — queued for submission
+    AcceptedAi,
+    /// AI finding you discarded
+    DiscardedAi,
+    /// A comment of your own that hasn't been posted
+    OwnDraft,
+    None,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +123,8 @@ pub enum InputMode {
     NewComment { diff_line: usize },
     Reply { thread_idx: usize, resolve: bool },
     EditClaude { claude_idx: usize },
+    /// Editing a comment of your own that hasn't been posted yet
+    EditDraft { draft_idx: usize },
 }
 
 impl DiffView {
@@ -122,10 +151,14 @@ impl DiffView {
             submit_status: None,
             line_threads: HashMap::new(),
             line_claude: HashMap::new(),
+            line_drafts: HashMap::new(),
             file_level_threads: Vec::new(),
             file_level_claude: Vec::new(),
+            file_level_drafts: Vec::new(),
             highlight_cache: HashMap::new(),
             pending_resolves: Vec::new(),
+            pending_resolve_ids: Vec::new(),
+            dirty: false,
             input_target_line: None,
         };
         view.rebuild_line_maps();
@@ -134,6 +167,39 @@ impl DiffView {
 
     pub fn set_threads(&mut self, threads: Vec<ReviewThread>) {
         self.threads = threads;
+        self.remap_thread_refs();
+    }
+
+    /// Bind draft replies and pending resolves loaded from disk to the thread
+    /// indices of the currently loaded threads, matching on comment id.
+    /// Anything that finds no match stays pending for a later thread load.
+    pub fn remap_thread_refs(&mut self) {
+        let mut id_to_thread: HashMap<u64, usize> = HashMap::new();
+        for (ti, thread) in self.threads.iter().enumerate() {
+            for comment in &thread.comments {
+                id_to_thread.entry(comment.id).or_insert(ti);
+            }
+        }
+
+        for draft in &mut self.draft_comments {
+            if draft.in_reply_to_thread.is_none() {
+                if let Some(id) = draft.reply_to_comment_id {
+                    draft.in_reply_to_thread = id_to_thread.get(&id).copied();
+                }
+            }
+        }
+
+        for id in std::mem::take(&mut self.pending_resolve_ids) {
+            match id_to_thread.get(&id) {
+                Some(&ti) => {
+                    if !self.pending_resolves.contains(&ti) {
+                        self.pending_resolves.push(ti);
+                    }
+                }
+                None => self.pending_resolve_ids.push(id),
+            }
+        }
+
         self.rebuild_line_maps();
     }
 
@@ -185,8 +251,10 @@ impl DiffView {
     fn rebuild_line_maps(&mut self) {
         self.line_threads.clear();
         self.line_claude.clear();
+        self.line_drafts.clear();
         self.file_level_threads.clear();
         self.file_level_claude.clear();
+        self.file_level_drafts.clear();
 
         let Some(file) = self.files.get(self.selected_file) else {
             return;
@@ -272,6 +340,68 @@ impl DiffView {
                 self.line_claude.entry(0).or_default().push(ci);
             }
         }
+
+        // Map your own standalone draft comments to diff lines. Replies are
+        // reached through their thread, so they're skipped here.
+        for (di, draft) in self.draft_comments.iter().enumerate() {
+            if draft.file != file.path || draft.in_reply_to_thread.is_some() {
+                continue;
+            }
+            let hit = file
+                .lines
+                .iter()
+                .position(|dl| dl.new_line == Some(draft.line))
+                .or_else(|| {
+                    file.lines
+                        .iter()
+                        .position(|dl| dl.old_line == Some(draft.line))
+                });
+            match hit {
+                Some(li) => self.line_drafts.entry(li).or_default().push(di),
+                // The line dropped out of the diff (e.g. narrowed commit
+                // range) — surface it at file level so it stays visible.
+                None => {
+                    self.file_level_drafts.push(di);
+                    self.line_drafts.entry(0).or_default().push(di);
+                }
+            }
+        }
+    }
+
+    /// Is there anything to stop at on this diff line — a review thread, an AI
+    /// finding, or a comment of your own? Drives n/N navigation.
+    pub fn has_comment_at(&self, li: usize) -> bool {
+        self.line_threads.contains_key(&li)
+            || self.line_claude.contains_key(&li)
+            || self.line_drafts.contains_key(&li)
+    }
+
+    /// Standalone drafts to draw at `li`. Drafts created by accepting an AI
+    /// finding are left out — that finding renders its own box. Rendering and
+    /// height computation both go through here so they can't disagree.
+    pub fn drafts_to_render_at(&self, li: usize) -> Vec<usize> {
+        let Some(indices) = self.line_drafts.get(&li) else { return Vec::new() };
+        indices
+            .iter()
+            .copied()
+            .filter(|&di| {
+                if self.file_level_drafts.contains(&di) {
+                    return false;
+                }
+                let Some(draft) = self.draft_comments.get(di) else { return false };
+                !self.is_accepted_ai_draft(draft)
+            })
+            .collect()
+    }
+
+    /// Did this draft come from accepting an AI finding?
+    fn is_accepted_ai_draft(&self, draft: &DraftComment) -> bool {
+        self.claude_comments.iter().any(|cc| {
+            cc.accepted == Some(true)
+                && cc.file == draft.file
+                && cc.line == draft.line
+                && cc.body == draft.body
+        })
     }
 
     pub fn scroll_up(&mut self) {
@@ -297,12 +427,27 @@ impl DiffView {
         self.cursor_line = self.cursor_line.saturating_sub(page_size);
     }
 
+    /// Mouse wheel: move the viewport and drag the cursor along so it keeps
+    /// its place on screen (otherwise adjust_scroll would snap the view back).
+    pub fn wheel_scroll(&mut self, delta: isize) {
+        let Some(file) = self.current_file() else { return };
+        let max = file.lines.len().saturating_sub(1);
+        let step = delta.unsigned_abs();
+        if delta < 0 {
+            self.scroll = self.scroll.saturating_sub(step);
+            self.cursor_line = self.cursor_line.saturating_sub(step);
+        } else {
+            self.scroll = (self.scroll + step).min(max);
+            self.cursor_line = (self.cursor_line + step).min(max);
+        }
+    }
+
     /// Compute rendered line count for each diff line (1 for the line itself + inline comments)
     pub fn compute_line_heights(&self, wrap_width: usize) -> Vec<usize> {
         let Some(file) = self.current_file() else { return Vec::new() };
         let w = wrap_width.max(10);
 
-        file.lines.iter().enumerate().map(|(li, dl)| {
+        file.lines.iter().enumerate().map(|(li, _dl)| {
             let mut h: usize = 1; // the diff line itself
 
             // Inline thread comments
@@ -312,7 +457,7 @@ impl DiffView {
                     if let Some(thread) = self.threads.get(ti) {
                         h += 1; // ┌─ Thread header
                         for comment in &thread.comments {
-                            h += count_wrapped_lines(&comment.body, w);
+                            h += count_wrapped_lines(&crate::html::to_text(&comment.body), w);
                         }
                         for draft in &self.draft_comments {
                             if draft.in_reply_to_thread == Some(ti) {
@@ -335,14 +480,12 @@ impl DiffView {
                 }
             }
 
-            // Draft new comments (not replies)
-            for draft in &self.draft_comments {
-                if draft.in_reply_to_thread.is_none() && draft.file == file.path {
-                    if dl.new_line == Some(draft.line) || dl.old_line == Some(draft.line) {
-                        h += 1; // header
-                        h += count_wrapped_lines(&draft.body, w);
-                        h += 1; // footer
-                    }
+            // Your own standalone draft comments
+            for di in self.drafts_to_render_at(li) {
+                if let Some(draft) = self.draft_comments.get(di) {
+                    h += 1; // header
+                    h += count_wrapped_lines(&draft.body, w);
+                    h += 1; // footer
                 }
             }
 
@@ -426,7 +569,7 @@ impl DiffView {
         if let Some(file) = self.current_file() {
             let max = file.lines.len();
             for li in (self.cursor_line + 1)..max {
-                if self.line_threads.contains_key(&li) || self.line_claude.contains_key(&li) {
+                if self.has_comment_at(li) {
                     self.cursor_line = li;
                     return None; // stayed in same file
                 }
@@ -441,7 +584,7 @@ impl DiffView {
             // Wrap: go to first comment in current file
             if let Some(file) = self.current_file() {
                 for li in 0..file.lines.len() {
-                    if self.line_threads.contains_key(&li) || self.line_claude.contains_key(&li) {
+                    if self.has_comment_at(li) {
                         self.cursor_line = li;
                         break;
                     }
@@ -456,7 +599,7 @@ impl DiffView {
         // Try within current file
         if self.cursor_line > 0 {
             for li in (0..self.cursor_line).rev() {
-                if self.line_threads.contains_key(&li) || self.line_claude.contains_key(&li) {
+                if self.has_comment_at(li) {
                     self.cursor_line = li;
                     return None;
                 }
@@ -474,7 +617,7 @@ impl DiffView {
     fn jump_to_first_comment(&mut self) {
         if let Some(file) = self.current_file() {
             for li in 0..file.lines.len() {
-                if self.line_threads.contains_key(&li) || self.line_claude.contains_key(&li) {
+                if self.has_comment_at(li) {
                     self.cursor_line = li;
                     return;
                 }
@@ -485,7 +628,7 @@ impl DiffView {
     fn jump_to_last_comment(&mut self) {
         if let Some(file) = self.current_file() {
             for li in (0..file.lines.len()).rev() {
-                if self.line_threads.contains_key(&li) || self.line_claude.contains_key(&li) {
+                if self.has_comment_at(li) {
                     self.cursor_line = li;
                     return;
                 }
@@ -546,27 +689,25 @@ impl DiffView {
                     line: line_num,
                     body: self.input_buffer.clone(),
                     in_reply_to_thread: None,
+                    reply_to_comment_id: None,
                     resolve: false,
                 });
+                self.dirty = true;
             }
             Some(InputMode::Reply { thread_idx, resolve }) => {
-                let line_num = self
-                    .threads
-                    .get(*thread_idx)
-                    .and_then(|t| t.line)
-                    .unwrap_or(0);
-                let file_path = self
-                    .threads
-                    .get(*thread_idx)
-                    .map(|t| t.path.clone())
-                    .unwrap_or_default();
+                let thread = self.threads.get(*thread_idx);
+                let line_num = thread.and_then(|t| t.line).unwrap_or(0);
+                let file_path = thread.map(|t| t.path.clone()).unwrap_or_default();
+                let root_id = thread.and_then(|t| t.comments.first()).map(|c| c.id);
                 self.draft_comments.push(DraftComment {
                     file: file_path,
                     line: line_num,
                     body: self.input_buffer.clone(),
                     in_reply_to_thread: Some(*thread_idx),
+                    reply_to_comment_id: root_id,
                     resolve: *resolve,
                 });
+                self.dirty = true;
             }
             Some(InputMode::EditClaude { claude_idx }) => {
                 if let Some(cc) = self.claude_comments.get_mut(*claude_idx) {
@@ -577,8 +718,34 @@ impl DiffView {
                         line: cc.line,
                         body: cc.body.clone(),
                         in_reply_to_thread: None,
+                        reply_to_comment_id: None,
                         resolve: false,
                     });
+                    self.dirty = true;
+                }
+            }
+            Some(InputMode::EditDraft { draft_idx }) => {
+                let di = *draft_idx;
+                let new_body = self.input_buffer.clone();
+                if let Some(draft) = self.draft_comments.get(di) {
+                    // If this draft mirrors an accepted AI finding, retitle
+                    // that finding too so the two don't drift apart and get
+                    // drawn as two separate boxes.
+                    let (file, line, old_body) =
+                        (draft.file.clone(), draft.line, draft.body.clone());
+                    for cc in self.claude_comments.iter_mut() {
+                        if cc.accepted == Some(true)
+                            && cc.file == file
+                            && cc.line == line
+                            && cc.body == old_body
+                        {
+                            cc.body = new_body.clone();
+                        }
+                    }
+                }
+                if let Some(draft) = self.draft_comments.get_mut(di) {
+                    draft.body = new_body;
+                    self.dirty = true;
                 }
             }
             None => {}
@@ -586,6 +753,9 @@ impl DiffView {
         self.input_buffer.clear();
         self.input_cursor = 0;
         self.input_mode = None;
+        // The draft list changed, so the line map has to be rebuilt or the
+        // new comment won't render or be reachable with n/N.
+        self.rebuild_line_maps();
     }
 
     pub fn toggle_resolve(&mut self) {
@@ -698,21 +868,166 @@ impl DiffView {
                         line: cc.line,
                         body: cc.body.clone(),
                         in_reply_to_thread: None,
+                        reply_to_comment_id: None,
                         resolve: false,
                     });
+                    self.dirty = true;
                 }
             }
         }
+        self.rebuild_line_maps();
     }
 
-    /// Discard Claude comment at/near cursor
-    pub fn discard_claude_at_cursor(&mut self) {
-        let indices = self.find_nearest_claude();
+    /// Toggle the discard flag on the AI comment(s) at/near the cursor.
+    ///
+    /// Comments that are pending or accepted become discarded; a comment that
+    /// is already discarded goes back to pending so it can be reconsidered.
+    /// Un-accepting also drops the draft comment the acceptance created.
+    pub fn toggle_discard_at_cursor(&mut self) {
+        let indices = self.find_nearest_claude_any();
+        if indices.is_empty() {
+            return;
+        }
+
+        // Everything already discarded → un-discard. Otherwise discard all.
+        let all_discarded = indices
+            .iter()
+            .filter_map(|&ci| self.claude_comments.get(ci))
+            .all(|c| c.accepted == Some(false));
+
         for ci in indices {
-            if let Some(cc) = self.claude_comments.get_mut(ci) {
-                if cc.accepted.is_none() {
-                    cc.accepted = Some(false);
+            let Some(cc) = self.claude_comments.get_mut(ci) else { continue };
+            if all_discarded {
+                cc.accepted = None;
+            } else {
+                let was_accepted = cc.accepted == Some(true);
+                cc.accepted = Some(false);
+                if was_accepted {
+                    let (file, line, body) = (cc.file.clone(), cc.line, cc.body.clone());
+                    self.draft_comments.retain(|d| {
+                        d.in_reply_to_thread.is_some()
+                            || !(d.file == file && d.line == line && d.body == body)
+                    });
                 }
+            }
+            self.dirty = true;
+        }
+        self.rebuild_line_maps();
+    }
+
+    /// Nearest standalone draft comment of yours within ±3 lines of the cursor
+    fn find_nearest_draft(&self) -> Option<usize> {
+        for offset in 0..=3usize {
+            let lines_to_check: Vec<usize> = if offset == 0 {
+                vec![self.cursor_line]
+            } else {
+                vec![self.cursor_line.saturating_sub(offset), self.cursor_line + offset]
+            };
+            for li in lines_to_check {
+                if let Some(&di) = self.line_drafts.get(&li).and_then(|v| v.first()) {
+                    return Some(di);
+                }
+            }
+        }
+        None
+    }
+
+    /// Nearest unposted reply of yours, found via the thread it hangs off
+    fn find_nearest_reply_draft(&self) -> Option<usize> {
+        let ti = self.find_nearest_thread()?;
+        self.draft_comments
+            .iter()
+            .position(|d| d.in_reply_to_thread == Some(ti))
+    }
+
+    /// An unposted comment of yours at the cursor — standalone, a reply, or
+    /// the copy created by accepting an AI finding.
+    pub fn find_draft_at_cursor(&self) -> Option<usize> {
+        self.find_nearest_draft()
+            .or_else(|| self.find_nearest_reply_draft())
+    }
+
+    /// What the cursor is sitting on. Editing, discarding and the key hints in
+    /// the status bar all read this, so the labels always match what the keys
+    /// actually do.
+    pub fn cursor_target(&self) -> CursorTarget {
+        let ai = self.find_nearest_claude_any();
+        if !ai.is_empty() {
+            let states: Vec<Option<bool>> = ai
+                .iter()
+                .filter_map(|&ci| self.claude_comments.get(ci))
+                .map(|c| c.accepted)
+                .collect();
+            if states.iter().all(|s| *s == Some(false)) {
+                return CursorTarget::DiscardedAi;
+            }
+            if states.iter().any(|s| s.is_none()) {
+                return CursorTarget::PendingAi;
+            }
+            return CursorTarget::AcceptedAi;
+        }
+        if self.find_draft_at_cursor().is_some() {
+            return CursorTarget::OwnDraft;
+        }
+        CursorTarget::None
+    }
+
+    /// `e` — edit whatever is under the cursor. A pending AI finding is edited
+    /// and accepted in one step; an accepted finding or a comment of your own
+    /// opens for rewording.
+    pub fn edit_at_cursor(&mut self) {
+        match self.cursor_target() {
+            CursorTarget::PendingAi => self.edit_claude_at_cursor(),
+            CursorTarget::AcceptedAi | CursorTarget::OwnDraft => self.edit_draft_at_cursor(),
+            // A discarded finding has to be brought back before it can be
+            // reworded, otherwise the edit would be invisible.
+            CursorTarget::DiscardedAi | CursorTarget::None => {}
+        }
+    }
+
+    fn edit_draft_at_cursor(&mut self) {
+        let Some(di) = self.find_draft_at_cursor() else { return };
+        let Some(draft) = self.draft_comments.get(di) else { return };
+        self.input_buffer = draft.body.clone();
+        self.input_cursor = self.input_buffer.len();
+        self.input_mode = Some(InputMode::EditDraft { draft_idx: di });
+    }
+
+    /// `d` — discard whatever is under the cursor. AI findings toggle between
+    /// discarded and pending; your own comments are removed outright, since
+    /// there would be nothing left to bring back.
+    pub fn discard_at_cursor(&mut self) {
+        match self.cursor_target() {
+            CursorTarget::PendingAi | CursorTarget::AcceptedAi | CursorTarget::DiscardedAi => {
+                self.toggle_discard_at_cursor()
+            }
+            CursorTarget::OwnDraft => self.remove_draft_at_cursor(),
+            CursorTarget::None => {}
+        }
+    }
+
+    /// Drop an unposted comment of yours.
+    pub fn remove_draft_at_cursor(&mut self) {
+        let Some(di) = self.find_draft_at_cursor() else { return };
+        if di >= self.draft_comments.len() {
+            return;
+        }
+        self.draft_comments.remove(di);
+        // Indices shifted, so anything holding one has to be rebuilt.
+        self.fix_indices_after_draft_removal(di);
+        self.dirty = true;
+        self.rebuild_line_maps();
+    }
+
+    /// Keep an open input box pointing at the right draft after a removal.
+    fn fix_indices_after_draft_removal(&mut self, removed: usize) {
+        if let Some(InputMode::EditDraft { draft_idx }) = &mut self.input_mode {
+            if *draft_idx == removed {
+                self.input_mode = None;
+                self.input_buffer.clear();
+                self.input_cursor = 0;
+            } else if *draft_idx > removed {
+                *draft_idx -= 1;
             }
         }
     }
@@ -1107,4 +1422,292 @@ fn copy_to_clipboard(text: &str) -> Result<&'static str, String> {
         }
     }
     Err(last_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DIFF: &str = "diff --git a/a.rs b/a.rs\n\
+@@ -1,2 +1,3 @@\n\
+ fn main() {\n\
++    let x = 1;\n\
+ }\n";
+
+    /// A view with one AI finding on the added line, cursor parked on it.
+    fn view_with_finding() -> DiffView {
+        let mut dv = DiffView::new(DIFF, "o/r".into(), 1);
+        dv.set_claude_comments(vec![ClaudeComment {
+            file: "a.rs".into(),
+            line: 2,
+            body: "unused binding".into(),
+            severity: Some("LOW".into()),
+            accepted: None,
+        }]);
+        // The added line is new-file line 2.
+        dv.cursor_line = dv
+            .files[0]
+            .lines
+            .iter()
+            .position(|l| l.new_line == Some(2) && l.kind == LineKind::Added)
+            .expect("added line present");
+        assert!(
+            dv.has_pending_ai_at_cursor(),
+            "finding should be reachable from the cursor"
+        );
+        dv
+    }
+
+    #[test]
+    fn d_discards_then_brings_the_finding_back() {
+        let mut dv = view_with_finding();
+
+        dv.toggle_discard_at_cursor();
+        assert_eq!(dv.claude_comments[0].accepted, Some(false));
+        assert_eq!(dv.cursor_target(), CursorTarget::DiscardedAi);
+        assert!(dv.dirty, "a decision must be persisted");
+
+        // Pressing d again un-discards it, so it can be reconsidered.
+        dv.toggle_discard_at_cursor();
+        assert_eq!(dv.claude_comments[0].accepted, None);
+        assert_ne!(dv.cursor_target(), CursorTarget::DiscardedAi);
+        assert!(dv.has_pending_ai_at_cursor());
+    }
+
+    #[test]
+    fn d_on_an_accepted_finding_discards_it_and_drops_its_draft() {
+        let mut dv = view_with_finding();
+
+        dv.accept_claude_at_cursor();
+        assert_eq!(dv.claude_comments[0].accepted, Some(true));
+        assert_eq!(dv.draft_comments.len(), 1, "accepting queues a comment");
+
+        dv.toggle_discard_at_cursor();
+        assert_eq!(dv.claude_comments[0].accepted, Some(false));
+        assert!(
+            dv.draft_comments.is_empty(),
+            "un-accepting must withdraw the queued comment"
+        );
+    }
+
+    #[test]
+    fn discarded_findings_are_not_re_accepted_by_a() {
+        let mut dv = view_with_finding();
+        dv.toggle_discard_at_cursor();
+        dv.accept_claude_at_cursor();
+        assert_eq!(
+            dv.claude_comments[0].accepted,
+            Some(false),
+            "a must not resurrect a discarded finding"
+        );
+        assert!(dv.draft_comments.is_empty());
+    }
+
+
+    /// Cursor position of the added line (new-file line 2).
+    fn added_line_idx(dv: &DiffView) -> usize {
+        dv.files[0]
+            .lines
+            .iter()
+            .position(|l| l.new_line == Some(2) && l.kind == LineKind::Added)
+            .expect("added line present")
+    }
+
+    fn view_with_manual_comment() -> DiffView {
+        let mut dv = DiffView::new(DIFF, "o/r".into(), 1);
+        dv.cursor_line = added_line_idx(&dv);
+        dv.start_new_comment();
+        dv.input_buffer = "please rename this".into();
+        dv.submit_input();
+        assert_eq!(dv.draft_comments.len(), 1);
+        dv
+    }
+
+    #[test]
+    fn n_navigation_stops_on_manually_added_comments() {
+        let mut dv = view_with_manual_comment();
+        let target = added_line_idx(&dv);
+
+        // Walk away from the comment, then jump forward to it.
+        dv.cursor_line = 0;
+        assert!(
+            dv.has_comment_at(target),
+            "manual comment must register on its line"
+        );
+        dv.jump_next_comment_or_file();
+        assert_eq!(dv.cursor_line, target, "n should land on the manual comment");
+
+        // And back again from below.
+        dv.cursor_line = dv.files[0].lines.len() - 1;
+        dv.jump_prev_comment_or_file();
+        assert_eq!(dv.cursor_line, target, "N should land on the manual comment");
+    }
+
+    #[test]
+    fn manual_comment_can_be_edited() {
+        let mut dv = view_with_manual_comment();
+        dv.dirty = false;
+
+        dv.edit_at_cursor();
+        assert!(
+            matches!(dv.input_mode, Some(InputMode::EditDraft { draft_idx: 0 })),
+            "e should open the draft for editing"
+        );
+        assert_eq!(
+            dv.input_buffer, "please rename this",
+            "editing starts from the existing text"
+        );
+
+        dv.input_buffer = "rename to snake_case".into();
+        dv.submit_input();
+
+        assert_eq!(dv.draft_comments.len(), 1, "editing must not add a comment");
+        assert_eq!(dv.draft_comments[0].body, "rename to snake_case");
+        assert!(dv.dirty, "an edit must be persisted");
+    }
+
+    #[test]
+    fn manual_comment_can_be_removed() {
+        let mut dv = view_with_manual_comment();
+        dv.dirty = false;
+
+        dv.discard_at_cursor();
+        assert!(dv.draft_comments.is_empty(), "d should remove the draft");
+        assert!(dv.dirty, "a removal must be persisted");
+        assert!(
+            !dv.has_comment_at(added_line_idx(&dv)),
+            "removed comment must leave the navigation map"
+        );
+    }
+
+    #[test]
+    fn editing_an_accepted_finding_keeps_it_in_one_box() {
+        let mut dv = view_with_finding();
+        dv.accept_claude_at_cursor();
+
+        // The accepted finding renders itself; its mirror draft must not
+        // draw a second box.
+        assert!(
+            dv.drafts_to_render_at(dv.cursor_line).is_empty(),
+            "accepted finding must not also render as a draft"
+        );
+
+        // Editing it updates both sides so they stay a single box.
+        dv.edit_at_cursor();
+        dv.input_buffer = "reworded".into();
+        dv.submit_input();
+
+        assert_eq!(dv.claude_comments[0].body, "reworded");
+        assert_eq!(dv.draft_comments[0].body, "reworded");
+        assert!(
+            dv.drafts_to_render_at(dv.cursor_line).is_empty(),
+            "still one box after editing"
+        );
+    }
+
+    #[test]
+    fn rendered_and_measured_heights_agree_for_drafts() {
+        // A mismatch here makes the cursor drift while scrolling.
+        let mut dv = view_with_manual_comment();
+        let li = added_line_idx(&dv);
+        let heights = dv.compute_line_heights(60);
+        // 1 diff line + header + one body line + footer
+        assert_eq!(heights[li], 4);
+
+        // Accepting an AI finding adds a mirror draft that isn't drawn, so
+        // the height must not grow twice.
+        dv.draft_comments.clear();
+        dv.set_claude_comments(vec![ClaudeComment {
+            file: "a.rs".into(),
+            line: 2,
+            body: "unused".into(),
+            severity: None,
+            accepted: None,
+        }]);
+        dv.cursor_line = li;
+        dv.accept_claude_at_cursor();
+        let heights = dv.compute_line_heights(60);
+        assert_eq!(heights[li], 4, "accepted finding counted once");
+    }
+
+    #[test]
+    fn a_draft_reply_is_editable_through_its_thread() {
+        let mut dv = DiffView::new(DIFF, "o/r".into(), 1);
+        dv.set_threads(vec![ReviewThread {
+            path: "a.rs".into(),
+            line: Some(2),
+            side: DiffSide::Right,
+            is_resolved: false,
+            comments: vec![crate::github::ThreadComment {
+                id: 7,
+                author: "them".into(),
+                body: "why?".into(),
+                created_at: String::new(),
+            }],
+            node_id: None,
+        }]);
+        dv.cursor_line = added_line_idx(&dv);
+
+        dv.start_reply();
+        dv.input_buffer = "because of X".into();
+        dv.submit_input();
+        assert_eq!(dv.draft_comments.len(), 1);
+
+        assert_eq!(dv.cursor_target(), CursorTarget::OwnDraft, "reply should be reachable");
+        dv.edit_at_cursor();
+        assert_eq!(dv.input_buffer, "because of X");
+        dv.input_buffer = "because of Y".into();
+        dv.submit_input();
+        assert_eq!(dv.draft_comments[0].body, "because of Y");
+        assert_eq!(dv.draft_comments[0].in_reply_to_thread, Some(0));
+
+        dv.discard_at_cursor();
+        assert!(dv.draft_comments.is_empty(), "d should drop the reply");
+    }
+
+    #[test]
+    fn saved_replies_rebind_to_threads_by_comment_id() {
+        let mut dv = DiffView::new(DIFF, "o/r".into(), 1);
+        // A reply and a resolve restored from disk, before threads load.
+        dv.draft_comments.push(DraftComment {
+            file: "a.rs".into(),
+            line: 2,
+            body: "agreed".into(),
+            in_reply_to_thread: None,
+            reply_to_comment_id: Some(4242),
+            resolve: false,
+        });
+        dv.pending_resolve_ids.push(4242);
+
+        dv.set_threads(vec![ReviewThread {
+            path: "a.rs".into(),
+            line: Some(2),
+            side: DiffSide::Right,
+            is_resolved: false,
+            comments: vec![crate::github::ThreadComment {
+                id: 4242,
+                author: "someone".into(),
+                body: "please fix".into(),
+                created_at: String::new(),
+            }],
+            node_id: Some("node".into()),
+        }]);
+
+        assert_eq!(dv.draft_comments[0].in_reply_to_thread, Some(0));
+        assert_eq!(dv.pending_resolves, vec![0]);
+        assert!(dv.pending_resolve_ids.is_empty());
+    }
+
+    #[test]
+    fn unmatched_resolve_ids_survive_until_their_thread_arrives() {
+        let mut dv = DiffView::new(DIFF, "o/r".into(), 1);
+        dv.pending_resolve_ids.push(999);
+        dv.set_threads(Vec::new());
+        assert_eq!(
+            dv.pending_resolve_ids,
+            vec![999],
+            "must not silently drop a pending resolve"
+        );
+        assert!(dv.pending_resolves.is_empty());
+    }
 }

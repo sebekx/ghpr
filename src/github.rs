@@ -20,6 +20,8 @@ pub struct PullRequest {
     pub body: Option<String>,
     #[serde(default)]
     pub requested_reviewers: Vec<GhUser>,
+    #[serde(default)]
+    pub assignees: Vec<GhUser>,
     pub head: GitRef,
     pub base: GitRef,
     #[serde(default)]
@@ -423,6 +425,21 @@ impl GithubClient {
             repo, pr_number
         ))
         .await
+    }
+
+    /// Fetch just the state ("open" / "closed") of a PR — used to decide
+    /// whether a local draft belongs to a PR that has since been closed.
+    pub async fn fetch_pr_state(&self, repo: &str, pr_number: u64) -> Result<String> {
+        #[derive(Deserialize)]
+        struct StateOnly {
+            state: String,
+        }
+        let url = format!(
+            "https://api.github.com/repos/{}/pulls/{}",
+            repo, pr_number
+        );
+        let resp: StateOnly = self.get(&url).await?;
+        Ok(resp.state)
     }
 
     /// Fetch commits for a PR (chronological, oldest first)

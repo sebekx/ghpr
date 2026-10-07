@@ -1,6 +1,8 @@
-use crate::app::{ci_icon, App, Panel};
-use crate::diff_view::{DiffView, LineKind};
+use crate::app::{ci_icon, spinner_char as spinner, App, HitMap, Panel, Selection};
+use crate::diff_view::{CursorTarget, DiffView, LineKind};
 use crate::github::CiState;
+use crate::html;
+use unicode_width::UnicodeWidthStr;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -8,12 +10,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
-
-const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-fn spinner(frame: usize) -> char {
-    SPINNER_FRAMES[(frame / 2) % SPINNER_FRAMES.len()]
-}
 
 const NERD_PR: &str = "\u{f407}";
 const NERD_USER: &str = "\u{f007}";
@@ -82,6 +78,7 @@ fn wrap_text_2(text: &str, first_width: usize, rest_width: usize) -> Vec<String>
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.frame = app.frame.wrapping_add(1);
+    *app.hit.borrow_mut() = HitMap { screen: f.area(), ..Default::default() };
     let size = f.area();
 
     // Ensure syntax highlighting and scroll are correct for current file
@@ -108,6 +105,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Some(crate::diff_view::InputMode::EditClaude { claude_idx }) => {
                     dv.line_claude.iter()
                         .find(|(_, cis)| cis.contains(claude_idx))
+                        .map(|(&li, _)| li)
+                },
+                Some(crate::diff_view::InputMode::EditDraft { draft_idx }) => {
+                    dv.line_drafts.iter()
+                        .find(|(_, dis)| dis.contains(draft_idx))
                         .map(|(&li, _)| li)
                 },
                 None => None,
@@ -157,12 +159,101 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_help {
         draw_help_popup(f, size);
     }
+
+    if let Some(msg) = &app.flash {
+        draw_flash(f, msg, size);
+    }
+    draw_selection(f, app);
+}
+
+/// Short notice in the bottom-right corner, over the status bar.
+fn draw_flash(f: &mut Frame, msg: &str, area: Rect) {
+    let text = format!(" {} ", msg);
+    let w = (UnicodeWidthStr::width(text.as_str()) as u16).min(area.width);
+    if w == 0 || area.height == 0 {
+        return;
+    }
+    let rect = Rect::new(area.right() - w, area.bottom() - 1, w, 1);
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::Green)),
+        rect,
+    );
+}
+
+/// Width of the line-number/sign gutter in front of each diff line. Copying
+/// skips it so selected code pastes cleanly.
+const DIFF_GUTTER: u16 = 14;
+
+/// Per-row column ranges (inclusive) covered by the selection, in screen
+/// order. Stream selection like a terminal, clipped to the pane.
+fn selection_rows(sel: &Selection, hit: &HitMap) -> Vec<(u16, u16, u16)> {
+    let (start, end) = if (sel.anchor.1, sel.anchor.0) <= (sel.head.1, sel.head.0) {
+        (sel.anchor, sel.head)
+    } else {
+        (sel.head, sel.anchor)
+    };
+    let pane = sel.pane;
+    let in_content = hit.content.width > 0 && pane == inner(hit.content);
+    let mut rows = Vec::new();
+    for y in start.1..=end.1 {
+        let mut x0 = if y == start.1 { start.0 } else { pane.x };
+        let x1 = if y == end.1 { end.0 } else { pane.right().saturating_sub(1) };
+        if in_content && hit.code_rows.iter().any(|(row, _)| *row == y) {
+            x0 = x0.max(pane.x + DIFF_GUTTER);
+        }
+        if x0 <= x1 {
+            rows.push((y, x0, x1));
+        }
+    }
+    rows
+}
+
+pub fn inner(r: Rect) -> Rect {
+    Rect::new(
+        r.x.saturating_add(1),
+        r.y.saturating_add(1),
+        r.width.saturating_sub(2),
+        r.height.saturating_sub(2),
+    )
+}
+
+fn draw_selection(f: &mut Frame, app: &mut App) {
+    let Some(sel) = app.selection.as_mut() else { return };
+    if !sel.dragged {
+        return;
+    }
+    let rows = selection_rows(sel, &app.hit.borrow());
+    let buf = f.buffer_mut();
+
+    if sel.copy {
+        sel.copy = false;
+        let mut text = Vec::new();
+        for &(y, x0, x1) in &rows {
+            let mut line = String::new();
+            let mut x = x0;
+            while x <= x1 {
+                let sym = buf[(x, y)].symbol();
+                line.push_str(sym);
+                // A wide character owns the cells after it.
+                x += (UnicodeWidthStr::width(sym) as u16).max(1);
+            }
+            text.push(line.trim_end().to_string());
+        }
+        app.clipboard_out = Some(text.join("\n"));
+    }
+
+    for &(y, x0, x1) in &rows {
+        for x in x0..=x1 {
+            buf[(x, y)].set_bg(Color::Rgb(60, 80, 140));
+        }
+    }
 }
 
 
 fn draw_help_popup(f: &mut Frame, area: Rect) {
     let w = 52u16.min(area.width.saturating_sub(4));
-    let h = 34u16.min(area.height.saturating_sub(4));
+    let h = 52u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup_area = Rect::new(x, y, w, h);
@@ -177,6 +268,21 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
     let h = |icon: &str, color: Color, desc: &str| -> Line<'static> {
         Line::from(vec![
             Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+            Span::styled(desc.to_string(), Style::default().fg(Color::White)),
+        ])
+    };
+
+    // Legend row whose icon and count are coloured separately, matching the
+    // two-tone indicators in the PR list.
+    let two = |icon: &str,
+               icon_color: Color,
+               count: &str,
+               count_color: Color,
+               desc: &str|
+     -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("  {}", icon), Style::default().fg(icon_color)),
+            Span::styled(format!("{} ", count), Style::default().fg(count_color)),
             Span::styled(desc.to_string(), Style::default().fg(Color::White)),
         ])
     };
@@ -213,10 +319,30 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         h("\u{f06a}", Color::Red, "Changes requested"),
         h("\u{f075}", Color::Yellow, "Has review comments"),
         Line::from(""),
+        s("Local review draft"),
+        h("⠹", Color::Rgb(200, 120, 255), "AI review running now"),
+        h("\u{f017}", Color::DarkGray, "AI review queued"),
+        h("\u{f071}", Color::Red, "AI review failed (see Details)"),
+        two(
+            "\u{f12a}",
+            Color::Magenta,
+            "n",
+            crate::app::AI_COUNT_COLOR,
+            "AI findings to triage",
+        ),
+        two(
+            "\u{f040}",
+            Color::Green,
+            "n",
+            crate::app::DRAFT_COUNT_COLOR,
+            "your comments to submit",
+        ),
+        Line::from(""),
         s("Keys (PR list)"),
         h("↑↓/jk", Color::DarkGray, "Navigate"),
         h("a", Color::DarkGray, "Toggle assigned / all"),
         h("/", Color::DarkGray, "Filter"),
+        h("c", Color::DarkGray, "Run / retry AI review"),
         Line::from(""),
         s("Keys (Details)"),
         h("↑↓/jk", Color::DarkGray, "Scroll"),
@@ -231,6 +357,17 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         h("y", Color::DarkGray, "Copy thread (in diff view)"),
         h("?", Color::DarkGray, "Help"),
         h("q", Color::DarkGray, "Quit"),
+        Line::from(""),
+        s("Keys (AI comment in diff)"),
+        h("a", Color::DarkGray, "Accept as draft comment"),
+        h("e", Color::DarkGray, "Edit, then accept"),
+        h("d", Color::DarkGray, "Discard / bring back"),
+        Line::from(""),
+        s("Keys (your own draft comment)"),
+        h("n/N", Color::DarkGray, "Jump between all comments"),
+        h("e", Color::DarkGray, "Edit the draft"),
+        h("d", Color::DarkGray, "Remove the draft"),
+        h("S", Color::DarkGray, "Submit all drafts"),
     ];
 
     let paragraph = Paragraph::new(lines).block(block);
@@ -260,6 +397,7 @@ fn panel_border_style(app: &App, panel: Panel) -> Style {
 }
 
 fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
+    app.hit.borrow_mut().prs = area;
     if app.loading {
         let loading = Paragraph::new(format!(" Loading pull requests... {}", spinner(app.frame)))
             .block(
@@ -299,6 +437,7 @@ fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
                         Span::styled(" ──────────────────────────────────────", Style::default().fg(Color::DarkGray)),
                     ]);
                     items.push(ListItem::new(vec![sep_line]));
+                    app.hit.borrow_mut().pr_items.push(None);
                 }
             }
 
@@ -375,6 +514,12 @@ fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
 
+            // Local draft state: review running/queued/failed, undecided AI
+            // findings, unsubmitted changes
+            for (icon, color) in app.draft_indicators(&fpr.repo_name, pr.number) {
+                indicators.push(Span::styled(icon, Style::default().fg(color)));
+            }
+
             // Merge status indicators are now reflected in PR icon color
 
             let mut spans = vec![
@@ -412,10 +557,17 @@ fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
             ]);
 
             let item = ListItem::new(vec![line1, line2]);
-            items.push(if i == app.pr_index {
-                item.style(Style::default().bg(Color::Rgb(25, 25, 40)))
-            } else {
-                item
+            let is_mine = !app.username.is_empty() && pr.user.login == app.username;
+            let bg = match (i == app.pr_index, is_mine) {
+                (true, true) => Some(Color::Rgb(30, 70, 40)),
+                (false, true) => Some(Color::Rgb(15, 45, 22)),
+                (true, false) => Some(Color::Rgb(25, 25, 40)),
+                (false, false) => None,
+            };
+            app.hit.borrow_mut().pr_items.push(Some(i));
+            items.push(match bg {
+                Some(bg) => item.style(Style::default().bg(bg)),
+                None => item,
             });
     }
 
@@ -446,9 +598,11 @@ fn draw_prs_panel(f: &mut Frame, app: &App, area: Rect) {
     );
     let mut state = ListState::default().with_selected(Some(selected));
     f.render_stateful_widget(list, area, &mut state);
+    app.hit.borrow_mut().prs_offset = state.offset();
 }
 
 fn draw_details_panel(f: &mut Frame, app: &App, area: Rect) {
+    app.hit.borrow_mut().details = area;
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Details ")
@@ -556,7 +710,8 @@ fn draw_details_panel(f: &mut Frame, app: &App, area: Rect) {
 
     // Description
     if let Some(body) = &pr.body {
-        let body_trimmed = body.trim();
+        let body_text = html::to_text(body);
+        let body_trimmed = body_text.trim();
         if !body_trimmed.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -577,6 +732,77 @@ fn draw_details_panel(f: &mut Frame, app: &App, area: Rect) {
                 )));
             }
         }
+    }
+
+    // Local AI review state — including why it failed and how to retry.
+    if let Some(draft) = app.drafts.get(repo_name, pr.number) {
+        use crate::draft::ReviewState;
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("\u{f12a} {} review:", app.config.ai.name),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+
+        let running = app.is_reviewing(repo_name, pr.number);
+        if running {
+            lines.push(Line::from(Span::styled(
+                format!("  {} running…", spinner(app.frame)),
+                Style::default().fg(Color::Magenta),
+            )));
+        } else {
+            match draft.review_state {
+                ReviewState::Queued => lines.push(Line::from(Span::styled(
+                    "  \u{f017} queued",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                ReviewState::Running => lines.push(Line::from(Span::styled(
+                    "  \u{f017} queued (will restart)",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                ReviewState::Failed => {
+                    lines.push(Line::from(Span::styled(
+                        "  \u{f071} failed",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )));
+                    // The panel wraps its own text, so hand it one line.
+                    let reason = draft
+                        .review_error
+                        .as_deref()
+                        .unwrap_or("no reason recorded");
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", reason),
+                        Style::default().fg(Color::Rgb(255, 140, 140)),
+                    )));
+                    lines.push(Line::from(vec![
+                        Span::styled("  press ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("c", Style::default().fg(Color::Yellow)),
+                        Span::styled(" to run it again", Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
+                ReviewState::Done => {
+                    let pending = draft.pending_ai_count();
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  \u{f00c} {} finding{}, {} to triage",
+                            draft.ai_comments.len(),
+                            if draft.ai_comments.len() == 1 { "" } else { "s" },
+                            pending
+                        ),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+                ReviewState::NotRun => lines.push(Line::from(Span::styled(
+                    "  not run — press c to run it",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+            }
+        }
+    } else if app.is_approved_by_me(repo_name, pr.number) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "\u{f12a} AI review skipped — approved by you (c to run anyway)",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     if let Some(status) = app.pr_status(repo_name, pr.number) {
@@ -701,7 +927,8 @@ fn draw_details_panel(f: &mut Frame, app: &App, area: Rect) {
                     ));
                 }
                 lines.push(Line::from(header));
-                let body_trimmed = body.trim();
+                let body_text = html::to_text(body);
+                let body_trimmed = body_text.trim();
                 for (i, line) in body_trimmed.lines().enumerate() {
                     if i >= 6 {
                         lines.push(Line::from(Span::styled(
@@ -749,10 +976,10 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     };
     let panel_keys = match app.active_panel {
         Panel::PullRequests => format!(
-            "↑↓ navigate │ Tab panel │ a [{filter_label}] │ / filter │ Enter diff │ A approve │ r refresh │ o open │ ? help │ q quit"
+            "↑↓ navigate │ Tab panel │ a [{filter_label}] │ / filter │ Enter diff │ A approve │ c ai review │ r refresh │ o open │ ? help │ q quit"
         ),
         Panel::Details => format!(
-            "↑↓ scroll │ Tab panel │ a comment │ A approve │ Enter diff │ r refresh │ o open │ ? help │ q quit"
+            "↑↓ scroll │ Tab panel │ a comment │ A approve │ Enter diff │ c ai review │ r refresh │ o open │ ? help │ q quit"
         ),
     };
 
@@ -782,22 +1009,38 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(help, chunks[0]);
     }
 
-    let user_info = Paragraph::new(Span::styled(
+    // Right side: auto-review progress, then the logged-in user
+    let (running, queued) = app.auto_progress();
+    let mut right: Vec<Span> = Vec::new();
+    if running > 0 {
+        right.push(Span::styled(
+            format!("{} reviewing {} ", spinner(app.frame), running),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    if queued > 0 {
+        right.push(Span::styled(
+            format!("\u{f017} {} queued ", queued),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    right.push(Span::styled(
         format!(" {} {} ", NERD_USER, app.username),
         Style::default().fg(Color::Cyan),
-    ))
-    .alignment(ratatui::layout::Alignment::Right);
+    ));
+
+    let user_info = Paragraph::new(Line::from(right))
+        .alignment(ratatui::layout::Alignment::Right);
     f.render_widget(user_info, chunks[1]);
 }
 
 // ── Confirm quit popup ─────────────────────────────────────
 
 fn draw_confirm_quit_popup(f: &mut Frame, app: &App, area: Rect) {
-    let drafts = app.diff_view.as_ref().map_or(0, |dv| dv.draft_comments.len());
-    let resolves = app.diff_view.as_ref().map_or(0, |dv| dv.pending_resolves.len());
+    let (items, prs) = app.unsubmitted_totals();
 
-    let w = 50u16.min(area.width.saturating_sub(4));
-    let h = 7u16;
+    let w = 54u16.min(area.width.saturating_sub(4));
+    let h = 8u16;
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup_area = Rect::new(x, y, w, h);
@@ -806,34 +1049,35 @@ fn draw_confirm_quit_popup(f: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Unsaved drafts ")
+        .title(" Not submitted yet ")
         .border_style(Style::default().fg(Color::Yellow));
-
-    let mut detail_parts = Vec::new();
-    if drafts > 0 {
-        detail_parts.push(format!("{} draft comment{}", drafts, if drafts == 1 { "" } else { "s" }));
-    }
-    if resolves > 0 {
-        detail_parts.push(format!("{} pending resolve{}", resolves, if resolves == 1 { "" } else { "s" }));
-    }
-    let detail = detail_parts.join(", ");
 
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("  You have {}", detail),
+            format!(
+                "  {} item{} on {} PR{} not sent to GitHub.",
+                items,
+                if items == 1 { "" } else { "s" },
+                prs,
+                if prs == 1 { "" } else { "s" },
+            ),
             Style::default().fg(Color::Yellow),
         )),
         Line::from(Span::styled(
-            "  that haven't been submitted.",
-            Style::default().fg(Color::Yellow),
+            "  They stay saved locally — press S in the diff",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  view to submit them.",
+            Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  y ", Style::default().fg(Color::Red)),
-            Span::styled("discard & quit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("any key ", Style::default().fg(Color::Green)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled("  y ", Style::default().fg(Color::Green)),
+            Span::styled("quit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("any key ", Style::default().fg(Color::Yellow)),
+            Span::styled("stay", Style::default().fg(Color::DarkGray)),
         ]),
     ];
 
@@ -1052,6 +1296,7 @@ fn draw_diff_view(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
         let y = (area.height.saturating_sub(popup_height)) / 2;
         let popup_area = Rect::new(x, y, popup_width, popup_height);
         f.render_widget(Clear, popup_area);
+        app.hit.borrow_mut().popup = Some(popup_area);
 
         let title = if dv.loading_review {
             format!(" {} Review [{}] {} ", app.config.ai.name, app.config.ai.command, spinner(app.frame))
@@ -1149,6 +1394,9 @@ fn draw_file_tree(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
     );
     let mut state = ListState::default().with_selected(Some(app.tree_index));
     f.render_stateful_widget(list, area, &mut state);
+    let mut hit = app.hit.borrow_mut();
+    hit.tree = area;
+    hit.tree_offset = state.offset();
 }
 
 fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
@@ -1163,8 +1411,10 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
             .title(" Diff ")
             .border_style(Style::default().fg(content_border));
         f.render_widget(Paragraph::new(" No file selected").block(block), area);
+        app.hit.borrow_mut().content = area;
         return;
     };
+    app.hit.borrow_mut().content = area;
 
     let inner_width = area.width.saturating_sub(2) as usize; // inside borders
     let inner_height = area.height.saturating_sub(2) as usize;
@@ -1216,7 +1466,7 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                         format!("{}: ", comment.author)
                     };
                     let first_w = inner_width.saturating_sub(4 + author_prefix.len());
-                    let wrapped = wrap_text_2(&comment.body, first_w, cont_w);
+                    let wrapped = wrap_text_2(&html::to_text(&comment.body), first_w, cont_w);
                     lines.push(padded_line(vec![
                         Span::raw("  "),
                         Span::styled("│ ", resolved_style),
@@ -1298,10 +1548,45 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
         lines.push(Line::from(""));
     }
 
+    // Your own comments whose line has dropped out of the diff — shown here
+    // rather than silently hidden.
+    if scroll == 0 && !dv.file_level_drafts.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  \u{f040} Your comments (line not in this diff)",
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )));
+        let draft_bg = Color::Rgb(15, 25, 15);
+        let dw = inner_width.saturating_sub(6);
+        for &di in &dv.file_level_drafts {
+            if let Some(draft) = dv.draft_comments.get(di) {
+                lines.push(padded_line(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("┌─ \u{f040} Draft (line {}) ", draft.line),
+                        Style::default().fg(Color::Green),
+                    ),
+                ], inner_width, draft_bg));
+                for wl in &wrap_text_2(&draft.body, dw, dw) {
+                    lines.push(padded_line(vec![
+                        Span::raw("  "),
+                        Span::styled("│ ", Style::default().fg(Color::Green)),
+                        Span::styled(wl.clone(), Style::default().fg(Color::Rgb(180, 200, 180))),
+                    ], inner_width, draft_bg));
+                }
+                lines.push(padded_line(vec![
+                    Span::raw("  "),
+                    Span::styled("└─", Style::default().fg(Color::Green)),
+                ], inner_width, draft_bg));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+
     for (li, dl) in file.lines.iter().enumerate().skip(scroll).take(inner_height + 50) {
         let is_cursor = li == dv.cursor_line;
         let has_thread = dv.line_threads.contains_key(&li);
         let has_claude = dv.line_claude.contains_key(&li);
+        let has_draft = !dv.drafts_to_render_at(li).is_empty();
 
         // Line number
         let line_num = match (dl.old_line, dl.new_line) {
@@ -1330,6 +1615,8 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
             Span::styled("\u{f075}", Style::default().fg(Color::Yellow).bg(bg))
         } else if has_claude {
             Span::styled("\u{f12a}", Style::default().fg(Color::Magenta).bg(bg))
+        } else if has_draft {
+            Span::styled("\u{f040}", Style::default().fg(Color::Green).bg(bg))
         } else {
             Span::styled(" ", Style::default().bg(bg))
         };
@@ -1391,6 +1678,9 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                 Style::default().bg(bg),
             ));
         }
+        if lines.len() < inner_height {
+            app.hit.borrow_mut().code_rows.push((area.y + 1 + lines.len() as u16, li));
+        }
         lines.push(Line::from(spans));
 
         // Render inline comments after the line (skip file-level ones, shown at top)
@@ -1442,7 +1732,7 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                             format!("{}: ", comment.author)
                         };
                         let first_w = inner_width.saturating_sub(12 + author_prefix.len());
-                        let wrapped = wrap_text_2(&comment.body, first_w, cont_w);
+                        let wrapped = wrap_text_2(&html::to_text(&comment.body), first_w, cont_w);
                         // First line with author
                         lines.push(padded_line(vec![
                             Span::raw("          "),
@@ -1538,10 +1828,20 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
                                 Span::styled("discard", Style::default().fg(Color::DarkGray)),
                             ], inner_width, comment_bg));
                         }
-                        _ => {
+                        Some(false) => {
                             lines.push(padded_line(vec![
                                 Span::raw("          "),
                                 Span::styled("└─", frame_style),
+                                Span::styled(" d ", Style::default().fg(Color::Yellow)),
+                                Span::styled("bring back", Style::default().fg(Color::DarkGray)),
+                            ], inner_width, comment_bg));
+                        }
+                        Some(true) => {
+                            lines.push(padded_line(vec![
+                                Span::raw("          "),
+                                Span::styled("└─", frame_style),
+                                Span::styled(" d ", Style::default().fg(Color::Yellow)),
+                                Span::styled("discard", Style::default().fg(Color::DarkGray)),
                             ], inner_width, comment_bg));
                         }
                     }
@@ -1549,35 +1849,31 @@ fn draw_diff_content(f: &mut Frame, app: &App, dv: &DiffView, area: Rect) {
             }
         }
 
-        // Draft new comments (not replies, skip accepted AI comments already shown)
-        for draft in &dv.draft_comments {
-            if draft.in_reply_to_thread.is_none() && draft.file == file.path {
-                let matches = dl.new_line == Some(draft.line)
-                    || dl.old_line == Some(draft.line);
-                // Skip if this draft came from an accepted AI comment (already rendered above)
-                let from_accepted_ai = dv.claude_comments.iter().any(|cc| {
-                    cc.accepted == Some(true) && cc.file == draft.file && cc.line == draft.line && cc.body == draft.body
-                });
-                if matches && !from_accepted_ai {
-                    let draft_bg = Color::Rgb(15, 25, 15);
-                    let dw = inner_width.saturating_sub(14);
+        // Your own unposted comments on this line
+        for di in dv.drafts_to_render_at(li) {
+            if let Some(draft) = dv.draft_comments.get(di) {
+                let draft_bg = Color::Rgb(15, 25, 15);
+                let dw = inner_width.saturating_sub(14);
+                lines.push(padded_line(vec![
+                    Span::raw("          "),
+                    Span::styled("┌─ \u{f040} Draft ", Style::default().fg(Color::Green)),
+                ], inner_width, draft_bg));
+                let wrapped = wrap_text_2(&draft.body, dw, dw);
+                for wl in &wrapped {
                     lines.push(padded_line(vec![
                         Span::raw("          "),
-                        Span::styled("┌─ \u{f040} Draft ", Style::default().fg(Color::Green)),
-                    ], inner_width, draft_bg));
-                    let wrapped = wrap_text_2(&draft.body, dw, dw);
-                    for wl in &wrapped {
-                        lines.push(padded_line(vec![
-                            Span::raw("          "),
-                            Span::styled("│ ", Style::default().fg(Color::Green)),
-                            Span::styled(wl.clone(), Style::default().fg(Color::Rgb(180, 200, 180))),
-                        ], inner_width, draft_bg));
-                    }
-                    lines.push(padded_line(vec![
-                        Span::raw("          "),
-                        Span::styled("└─", Style::default().fg(Color::Green)),
+                        Span::styled("│ ", Style::default().fg(Color::Green)),
+                        Span::styled(wl.clone(), Style::default().fg(Color::Rgb(180, 200, 180))),
                     ], inner_width, draft_bg));
                 }
+                lines.push(padded_line(vec![
+                    Span::raw("          "),
+                    Span::styled("└─", Style::default().fg(Color::Green)),
+                    Span::styled(" e ", Style::default().fg(Color::Yellow)),
+                    Span::styled("edit │ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("d ", Style::default().fg(Color::Yellow)),
+                    Span::styled("remove", Style::default().fg(Color::DarkGray)),
+                ], inner_width, draft_bg));
             }
         }
     }
@@ -1620,6 +1916,7 @@ fn draw_input_overlay(f: &mut Frame, dv: &DiffView, diff_area: Rect) {
         Some(crate::diff_view::InputMode::NewComment { .. }) => (" New Comment ", false, false),
         Some(crate::diff_view::InputMode::Reply { resolve, .. }) => (" Reply ", true, *resolve),
         Some(crate::diff_view::InputMode::EditClaude { .. }) => (" Edit AI Comment ", false, false),
+        Some(crate::diff_view::InputMode::EditDraft { .. }) => (" Edit Draft Comment ", false, false),
         None => (" Comment ", false, false),
     };
 
@@ -1765,7 +2062,6 @@ fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, frame: usize, area: R
     // Context-dependent: only show when applicable
     let on_thread = dv.has_thread_at_cursor();
     let on_unresolved = dv.has_unresolved_thread_at_cursor();
-    let on_ai = dv.has_pending_ai_at_cursor();
 
     if on_thread {
         spans.push(sep.clone());
@@ -1777,18 +2073,33 @@ fn draw_diff_view_status_bar(f: &mut Frame, dv: &DiffView, frame: usize, area: R
         spans.push(Span::styled("R", key));
         spans.push(Span::styled(" resolve", dim));
     }
-    if on_ai {
+    // Key hints come from the same classification the keys themselves use.
+    let target = dv.cursor_target();
+    let hint = |k: &'static str, label: &'static str, spans: &mut Vec<Span>| {
         spans.push(sep.clone());
-        spans.push(Span::styled("a", key));
-        spans.push(Span::styled(" accept", dim));
-        spans.push(sep.clone());
-        spans.push(Span::styled("e", key));
-        spans.push(Span::styled(" edit", dim));
-        spans.push(sep.clone());
-        spans.push(Span::styled("d", key));
-        spans.push(Span::styled(" discard", dim));
+        spans.push(Span::styled(k, key));
+        spans.push(Span::styled(label, dim));
+    };
+    match target {
+        CursorTarget::PendingAi => {
+            hint("a", " accept", &mut spans);
+            hint("e", " edit", &mut spans);
+            hint("d", " discard", &mut spans);
+        }
+        CursorTarget::AcceptedAi => {
+            hint("e", " reword", &mut spans);
+            hint("d", " discard", &mut spans);
+        }
+        CursorTarget::DiscardedAi => {
+            hint("d", " bring back", &mut spans);
+        }
+        CursorTarget::OwnDraft => {
+            hint("e", " edit draft", &mut spans);
+            hint("d", " remove draft", &mut spans);
+        }
+        CursorTarget::None => {}
     }
-    if on_thread || on_ai {
+    if on_thread || target != CursorTarget::None {
         spans.push(sep.clone());
         spans.push(Span::styled("y", key));
         spans.push(Span::styled(" copy", dim));
